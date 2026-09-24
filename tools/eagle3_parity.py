@@ -1,6 +1,6 @@
 """Offline numerical parity for the EAGLE3 draft forward.
 
-Runs INSIDE vllm22-w4a8:combined (torch works there). Compares minisgl's GLMEagle3DraftModel.step
+Runs INSIDE the serve image via tools/run_seed_kv_parity.sh. Compares minisgl's GLMEagle3DraftModel.step_masked (HIP paged decode attention)
 against a self-contained reference forward built directly from the raw safetensors weights with
 explicit matmuls (the canonical llama_eagle3 midlayer math). Feeds BOTH the SAME fixed-random aux +
 token, so any divergence is a bug in the minisgl draft forward (not the aux capture or the serve).
@@ -121,8 +121,18 @@ def main():
     positions = torch.tensor([20, 21], device="cuda", dtype=torch.int32)
 
     fused = m.fuse_aux(aux)  # [B, hidden]
-    cache = []
-    mlogits, mhid = m.step(embed_e, fused, positions, cache)
+    # First draft step on an EMPTY ring: the only visible key is this token's own (what the deleted
+    # list-based step() saw with an empty cache). Same shipped step_masked + HIP decode kernel.
+    from minisgl.spec.draft_attn import DraftAttnBuilder
+    R = 64
+    k_buf = torch.zeros(B, R, Hkv, hd, device="cuda", dtype=dtype)
+    v_buf = torch.zeros_like(k_buf)
+    slots = torch.arange(B, device="cuda")
+    col = torch.zeros(B, dtype=torch.int64, device="cuda")
+    keep = torch.zeros(B, R, dtype=torch.bool, device="cuda")
+    keep[:, 0] = True
+    meta = DraftAttnBuilder(R, torch.device("cuda")).meta(slots, col, keep)
+    mlogits, mhid = m.step_masked(embed_e, fused, positions, k_buf, v_buf, slots, col, meta)
 
     # reference: fc then step
     rfused = F.linear(aux.reshape(B, -1), sd["fc.weight"].to(dtype))

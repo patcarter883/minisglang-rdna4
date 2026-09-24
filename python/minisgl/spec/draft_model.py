@@ -9,6 +9,7 @@ from minisgl.utils import init_logger
 
 from .base import ProposeContext
 from .capture import CapturableProposer, StagedPropose
+from .draft_attn import DraftAttnBuilder
 
 if TYPE_CHECKING:
     from minisgl.core import Req
@@ -91,7 +92,18 @@ class DraftModelProposer(CapturableProposer):
         eps = float(hf.rms_norm_eps)
         rp = getattr(hf, "rope_parameters", None) or getattr(hf, "rope_scaling", None) or {}
         rope_theta = float(rp.get("rope_theta", getattr(hf, "rope_theta", 1e6)))
-        max_pos = int(hf.max_position_embeddings)
+        # The RoPE table must cover every position the DRAFT is asked to rotate, and that is the
+        # TARGET's absolute position (req.cached_len + j), not the draft checkpoint's training length.
+        # thoughtworks/GLM-4.7-Flash-Eagle3 declares max_position_embeddings=4096, and the table was
+        # sized from it: every propose past a 4096-token context read cos/sin OUT OF BOUNDS (the
+        # tail_hip rope kernel does not bound-check) — garbage rotations, i.e. blind drafts on exactly
+        # the long agent prompts this drafter serves, or a GPU page fault if the read left the pool
+        # (reproduced at position 100000 in tools/glm_drafter_attn_parity.py). Default RoPE is a closed
+        # form in the position, so a longer table is the same math, not an extrapolation choice. The
+        # page table's width is the engine's hard per-request position bound; +num_draft covers the
+        # chain's lookahead.
+        max_pos = max(int(hf.max_position_embeddings),
+                      int(engine.page_table.shape[1]) + int(num_draft) + 1)
 
         # Target decoder layers to capture for the EAGLE3 aux fusion. Checkpoint/SGLang ids count
         # the residual stream at the INPUT of layer i (`aux.append(hidden_states + residual)` BEFORE
@@ -166,8 +178,8 @@ class DraftModelProposer(CapturableProposer):
         # user says anything): accept-len 0.00 over 300 reqs, verify-width 0 for 100% of steps, every
         # verify eager because width 0 is not a captured rung — with nothing logged to say why.
         # A ring stores the most recent W positions at col = pos % W and masks from ABSOLUTE
-        # positions, so context is unbounded at fixed VRAM. The kernel needs no change: step_masked
-        # already takes an arbitrary write_col and an explicit mask_bias and never assumes
+        # positions, so context is unbounded at fixed VRAM. step_masked takes an arbitrary write_col
+        # and a block table built from the absolute-position keep mask, and never assumes
         # column == position. Same design as MTP's ring and DFlash's prefix ring.
         #
         # W=512 mirrors MTP's measured default, where a provenance-asserted sweep found W=512 matches
@@ -188,6 +200,10 @@ class DraftModelProposer(CapturableProposer):
         self._pos_buf = torch.full((self._max_slots, self._ring), -1,
                                    dtype=torch.int64, device=dev)
         self._col_idx = torch.arange(self._ring, device=dev)
+        # Paged view of the ring for attn_decode.flash_decode_paged. Resolve the kernel package NOW:
+        # a missing build must fail the boot, never surface mid-serve (and there is no torch path).
+        import attn_decode  # noqa: F401
+        self._attn_meta = DraftAttnBuilder(self._ring, dev)
         self._slot_uid: Dict[int, int] = {}
         self._drafted_slots: List[int] = []
         hidden = int(self._draft.hidden_size)
@@ -330,10 +346,13 @@ class DraftModelProposer(CapturableProposer):
             # Causal + in-window, keyed on ABSOLUTE positions: hides empty columns (-1), the future,
             # and anything the ring has already overwritten. Column order is meaningless once wrapped.
             keep = (pa >= 0) & (pa <= qa) & ((qa - pa) < self._ring)
-            mask_bias = torch.where(keep, 0.0, float("-inf")).to(torch.float32)
+            # The kept set is contiguous in absolute position, ending at q_abs, so it is handed to
+            # the paged HIP decode kernel as a block table over exactly those ring columns — the
+            # kernel reads the live keys only (spec/draft_attn.py), no mask, no full-ring gather.
+            meta = self._attn_meta.meta(slots, q_abs, keep)
             logits, cur_hidden = d.step_masked(
                 d.embed(cur_tok), cur_hidden, positions,
-                self._k_buf, self._v_buf, slots, write_col, mask_bias)
+                self._k_buf, self._v_buf, slots, write_col, meta)
             draft_id = logits.argmax(dim=-1)                        # compressed draft vocab
             target_id = draft_id + self._d2t[draft_id]              # -> target vocab, on device
             self._g_out[:bs, j] = target_id

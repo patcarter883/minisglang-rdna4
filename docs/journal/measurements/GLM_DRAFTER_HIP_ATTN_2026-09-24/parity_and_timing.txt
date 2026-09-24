@@ -1,0 +1,142 @@
+# 2026-09-24T17:35:02+10:00 image=minisgl-rdna4:specfix-20260924 repo=e776aef4 ROCR=1
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp', 'eagle3'] PARITY=True TIMING=False BS=1,4 CASES=all
+[parity] MTP round 0 step 0: attn max|d| 4.883e-04 (rel 7.47e-04)  logits max|d| 1.866e-01 (rel 4.18e-03)  argmax agree [True, True, True, True]  live keys [40, 100, 510, 510]
+[parity] MTP round 0 step 1: attn max|d| 1.465e-03 (rel 2.79e-03)  logits max|d| 9.191e-01 (rel 2.07e-02)  argmax agree [True, True, True, True]  live keys [41, 101, 511, 511]
+[parity] MTP round 0 step 2: attn max|d| 7.568e-03 (rel 1.45e-02)  logits max|d| 4.426e-01 (rel 1.23e-02)  argmax agree [True, True, True, True]  live keys [42, 102, 512, 512]
+[parity] MTP round 1 step 0: attn max|d| 2.441e-04 (rel 5.41e-04)  logits max|d| 3.451e-01 (rel 8.37e-03)  argmax agree [True, True, True, True]  live keys [41, 102, 510, 510]
+[parity] MTP round 1 step 1: attn max|d| 1.221e-03 (rel 2.28e-03)  logits max|d| 9.997e-01 (rel 2.32e-02)  argmax agree [True, True, True, True]  live keys [42, 103, 511, 511]
+[parity] MTP round 1 step 2: attn max|d| 4.578e-03 (rel 8.49e-03)  logits max|d| 3.866e-01 (rel 9.54e-03)  argmax agree [True, False, True, True]  live keys [43, 104, 512, 512]
+[parity] MTP round 2 step 0: attn max|d| 3.662e-04 (rel 6.57e-04)  logits max|d| 1.680e-01 (rel 4.43e-03)  argmax agree [True, True, True, True]  live keys [44, 103, 510, 510]
+[parity] MTP round 2 step 1: attn max|d| 9.766e-04 (rel 1.64e-03)  logits max|d| 3.697e-01 (rel 8.31e-03)  argmax agree [True, True, True, True]  live keys [45, 104, 511, 511]
+[parity] MTP round 2 step 2: attn max|d| 1.099e-03 (rel 1.96e-03)  logits max|d| 1.539e+00 (rel 3.29e-02)  argmax agree [True, True, True, True]  live keys [46, 105, 512, 512]
+[parity] MTP SUMMARY: worst attn max|d| 7.568e-03 (rel 1.45e-02), worst logits max|d| 1.539e+00 (rel 3.29e-02); drafted argmax agreement teacher-forced 24/24, free-running 24/24
+[graph] MTP: eager == graph replay (drafts, last logits, last hidden) bit-identical: YES; drafts [[96054, 96054, 154822], [96054, 89620, 154822], [154822, 154822, 7003], [23751, 154822, 61327]]
+[parity] EAGLE3 round 0 step 0: attn max|d| 1.953e-03 (rel 1.20e-04)  logits max|d| 7.812e-03 (rel 7.81e-04)  argmax agree [True, True, True, True]  live keys [40, 100, 507, 507]
+[parity] EAGLE3 round 0 step 1: attn max|d| 3.906e-03 (rel 2.31e-04)  logits max|d| 7.812e-03 (rel 8.26e-04)  argmax agree [True, True, True, True]  live keys [41, 101, 508, 508]
+[parity] EAGLE3 round 0 step 2: attn max|d| 1.953e-03 (rel 1.16e-04)  logits max|d| 3.906e-03 (rel 3.67e-04)  argmax agree [True, True, True, True]  live keys [42, 102, 509, 509]
+[parity] EAGLE3 round 0 step 3: attn max|d| 1.953e-03 (rel 1.36e-04)  logits max|d| 5.859e-03 (rel 4.94e-04)  argmax agree [True, True, True, True]  live keys [43, 103, 510, 510]
+[parity] EAGLE3 round 0 step 4: attn max|d| 1.953e-03 (rel 1.40e-04)  logits max|d| 7.812e-03 (rel 6.13e-04)  argmax agree [True, True, True, True]  live keys [44, 104, 511, 511]
+[parity] EAGLE3 round 0 step 5: attn max|d| 7.812e-03 (rel 6.16e-04)  logits max|d| 7.812e-03 (rel 5.83e-04)  argmax agree [True, True, True, True]  live keys [45, 105, 512, 512]
+[parity] EAGLE3 round 1 step 0: attn max|d| 1.953e-03 (rel 9.63e-05)  logits max|d| 3.906e-03 (rel 3.60e-04)  argmax agree [True, True, True, True]  live keys [41, 102, 507, 507]
+[parity] EAGLE3 round 1 step 1: attn max|d| 7.812e-03 (rel 4.86e-04)  logits max|d| 7.812e-03 (rel 7.97e-04)  argmax agree [True, True, True, True]  live keys [42, 103, 508, 508]
+[parity] EAGLE3 round 1 step 2: attn max|d| 3.906e-03 (rel 2.57e-04)  logits max|d| 3.906e-03 (rel 3.64e-04)  argmax agree [True, True, True, True]  live keys [43, 104, 509, 509]
+[parity] EAGLE3 round 1 step 3: attn max|d| 7.812e-03 (rel 5.58e-04)  logits max|d| 4.883e-03 (rel 4.22e-04)  argmax agree [True, True, True, True]  live keys [44, 105, 510, 510]
+[parity] EAGLE3 round 1 step 4: attn max|d| 1.953e-03 (rel 1.46e-04)  logits max|d| 7.812e-03 (rel 6.34e-04)  argmax agree [True, True, True, True]  live keys [45, 106, 511, 511]
+[parity] EAGLE3 round 1 step 5: attn max|d| 1.953e-03 (rel 1.49e-04)  logits max|d| 7.812e-03 (rel 6.06e-04)  argmax agree [True, True, True, True]  live keys [46, 107, 512, 512]
+[parity] EAGLE3 round 2 step 0: attn max|d| 1.953e-03 (rel 1.19e-04)  logits max|d| 3.906e-03 (rel 3.26e-04)  argmax agree [True, True, True, True]  live keys [47, 103, 507, 507]
+[parity] EAGLE3 round 2 step 1: attn max|d| 3.906e-03 (rel 2.35e-04)  logits max|d| 3.906e-03 (rel 4.69e-04)  argmax agree [True, True, True, True]  live keys [48, 104, 508, 508]
+[parity] EAGLE3 round 2 step 2: attn max|d| 3.906e-03 (rel 2.31e-04)  logits max|d| 7.812e-03 (rel 7.91e-04)  argmax agree [True, True, True, True]  live keys [49, 105, 509, 509]
+[parity] EAGLE3 round 2 step 3: attn max|d| 3.906e-03 (rel 2.65e-04)  logits max|d| 7.812e-03 (rel 7.97e-04)  argmax agree [True, True, True, True]  live keys [50, 106, 510, 510]
+[parity] EAGLE3 round 2 step 4: attn max|d| 1.953e-03 (rel 1.36e-04)  logits max|d| 7.812e-03 (rel 7.56e-04)  argmax agree [True, True, True, True]  live keys [51, 107, 511, 511]
+[parity] EAGLE3 round 2 step 5: attn max|d| 1.953e-03 (rel 1.38e-04)  logits max|d| 7.812e-03 (rel 7.00e-04)  argmax agree [True, True, True, True]  live keys [52, 108, 512, 512]
+[parity] EAGLE3 SUMMARY: worst attn max|d| 7.812e-03 (rel 6.16e-04), worst logits max|d| 7.812e-03 (rel 8.26e-04); drafted argmax agreement teacher-forced 72/72, free-running 72/72
+[graph] EAGLE3: eager == graph replay (drafts, last logits, last hidden) bit-identical: YES; drafts [[1782, 3093, 68275, 68275, 68275, 68275], [315, 35683, 315, 68275, 68275, 68275], [315, 68275, 68275, 68275, 68275, 68275], [1039, 85016, 19877, 19877, 19877, 19877]]
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=512/512
+[time] MTP attn-core   bs=1 R=512 live=512          old      76.3 us  new     72.5 us  ctl     72.5 us  speedup   1.05x  ctl-spread +0.01%  (old rounds 76.1-81.2, new 72.0-72.5)
+[time] MTP attn-module bs=1 R=512 live=512          old     224.4 us  new    203.2 us  ctl    204.0 us  speedup   1.10x  ctl-spread +0.38%  (old rounds 222.3-226.1, new 202.5-205.3)
+[time] MTP propose(3 steps) bs=1 R=512 live=512     old    3971.6 us  new   3913.1 us  ctl   3915.0 us  speedup   1.01x  ctl-spread +0.05%  (old rounds 3971.1-3973.4, new 3912.5-3914.1)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=2048/2048
+[time] MTP attn-core   bs=1 R=2048 live=2048        old     156.3 us  new     82.8 us  ctl     82.8 us  speedup   1.89x  ctl-spread +0.02%  (old rounds 155.7-162.2, new 82.4-83.0)
+[time] MTP attn-module bs=1 R=2048 live=2048        old     305.8 us  new    217.0 us  ctl    217.9 us  speedup   1.41x  ctl-spread +0.41%  (old rounds 304.5-309.4, new 216.2-219.4)
+[time] MTP propose(3 steps) bs=1 R=2048 live=2048   old    4296.1 us  new   3951.4 us  ctl   3923.6 us  speedup   1.09x  ctl-spread -0.70%  (old rounds 4295.8-4296.5, new 3951.2-3951.9)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[time] MTP attn-core   bs=1 R=8192 live=8192        old     584.7 us  new    125.0 us  ctl    125.9 us  speedup   4.68x  ctl-spread +0.71%  (old rounds 579.2-591.2, new 124.2-127.3)
+[time] MTP attn-module bs=1 R=8192 live=8192        old     734.4 us  new    254.2 us  ctl    261.3 us  speedup   2.89x  ctl-spread +2.82%  (old rounds 734.0-737.0, new 253.4-262.6)
+[bench] mtp bs=1 8192/8192 attempt 1 rc=139
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[time] MTP attn-core   bs=1 R=8192 live=8192        old     583.7 us  new    125.3 us  ctl    125.8 us  speedup   4.66x  ctl-spread +0.43%  (old rounds 578.3-589.4, new 124.3-127.5)
+[time] MTP attn-module bs=1 R=8192 live=8192        old     735.7 us  new    254.4 us  ctl    261.6 us  speedup   2.89x  ctl-spread +2.84%  (old rounds 735.5-739.0, new 253.4-262.9)
+[time] MTP propose(3 steps) bs=1 R=8192 live=8192   old    5556.6 us  new   4066.5 us  ctl   4065.7 us  speedup   1.37x  ctl-spread -0.02%  (old rounds 5555.7-5557.5, new 4065.2-4068.2)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=512/64
+[time] MTP attn-core   bs=1 R=512 live=64           old      76.3 us  new     69.1 us  ctl     69.1 us  speedup   1.11x  ctl-spread +0.06%  (old rounds 76.3-81.1, new 68.0-69.1)
+[time] MTP attn-module bs=1 R=512 live=64           old     224.3 us  new    200.0 us  ctl    200.6 us  speedup   1.12x  ctl-spread +0.32%  (old rounds 222.8-226.1, new 199.0-201.7)
+[time] MTP propose(3 steps) bs=1 R=512 live=64      old    3954.2 us  new   3908.3 us  ctl   3901.0 us  speedup   1.01x  ctl-spread -0.19%  (old rounds 3954.1-3957.4, new 3908.1-3908.4)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=512/512
+[time] MTP attn-core   bs=4 R=512 live=512          old     191.2 us  new     85.3 us  ctl     85.5 us  speedup   2.24x  ctl-spread +0.28%  (old rounds 190.4-196.8, new 85.1-85.4)
+[time] MTP attn-module bs=4 R=512 live=512          old     363.9 us  new    246.7 us  ctl    247.5 us  speedup   1.48x  ctl-spread +0.34%  (old rounds 360.2-368.5, new 246.1-248.6)
+[time] MTP propose(3 steps) bs=4 R=512 live=512     old    5167.3 us  new   4745.2 us  ctl   4747.3 us  speedup   1.09x  ctl-spread +0.04%  (old rounds 5161.7-5170.8, new 4742.7-4746.7)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[time] MTP attn-core   bs=4 R=2048 live=2048        old    1165.0 us  new    121.0 us  ctl    121.0 us  speedup   9.63x  ctl-spread +0.06%  (old rounds 1156.1-1183.5, new 120.6-122.3)
+[time] MTP attn-module bs=4 R=2048 live=2048        old    1342.2 us  new    275.8 us  ctl    275.5 us  speedup   4.87x  ctl-spread -0.10%  (old rounds 1341.2-1342.8, new 275.5-276.0)
+[bench] mtp bs=4 2048/2048 attempt 1 rc=134
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[time] MTP attn-core   bs=4 R=2048 live=2048        old    1160.6 us  new    120.8 us  ctl    121.1 us  speedup   9.60x  ctl-spread +0.21%  (old rounds 1151.9-1180.4, new 120.6-121.9)
+[time] MTP attn-module bs=4 R=2048 live=2048        old    1343.5 us  new    275.8 us  ctl    275.5 us  speedup   4.87x  ctl-spread -0.12%  (old rounds 1342.3-1344.0, new 275.3-275.9)
+[time] MTP propose(3 steps) bs=4 R=2048 live=2048   old    7921.7 us  new   4800.3 us  ctl   4794.0 us  speedup   1.65x  ctl-spread -0.13%  (old rounds 7920.9-7928.5, new 4794.2-4804.9)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=8192/8192
+[time] MTP attn-core   bs=4 R=8192 live=8192        old    5678.3 us  new    263.1 us  ctl    265.2 us  speedup  21.58x  ctl-spread +0.79%  (old rounds 5673.6-5733.0, new 262.6-266.2)
+[time] MTP attn-module bs=4 R=8192 live=8192        old    5876.7 us  new    426.3 us  ctl    433.9 us  speedup  13.78x  ctl-spread +1.77%  (old rounds 5875.9-5877.0, new 426.1-433.9)
+[time] MTP propose(3 steps) bs=4 R=8192 live=8192   old   21534.5 us  new   5221.0 us  ctl   5222.1 us  speedup   4.12x  ctl-spread +0.02%  (old rounds 21530.0-21536.4, new 5220.4-5223.7)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=512/64
+[time] MTP attn-core   bs=4 R=512 live=64           old     191.0 us  new     75.9 us  ctl     75.9 us  speedup   2.52x  ctl-spread +0.00%  (old rounds 190.2-196.1, new 75.8-76.0)
+[time] MTP attn-module bs=4 R=512 live=64           old     364.6 us  new    235.3 us  ctl    236.3 us  speedup   1.55x  ctl-spread +0.43%  (old rounds 361.3-369.3, new 234.0-237.8)
+[time] MTP propose(3 steps) bs=4 R=512 live=64      old    5164.6 us  new   4708.1 us  ctl   4710.0 us  speedup   1.10x  ctl-spread +0.04%  (old rounds 5164.0-5171.1, new 4706.2-4708.3)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/512
+[time] EAGLE3 attn-core   bs=1 R=512 live=512       old      51.1 us  new     64.3 us  ctl     64.2 us  speedup   0.79x  ctl-spread -0.12%  (old rounds 50.8-51.3, new 63.4-65.0)
+[time] EAGLE3 attn-module bs=1 R=512 live=512       old     216.6 us  new    228.0 us  ctl    227.5 us  speedup   0.95x  ctl-spread -0.21%  (old rounds 214.0-219.4, new 225.0-230.8)
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=512  old    5090.6 us  new   5114.8 us  ctl   5113.3 us  speedup   1.00x  ctl-spread -0.03%  (old rounds 5089.6-5091.3, new 5113.3-5116.9)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=2048/2048
+[time] EAGLE3 attn-core   bs=1 R=2048 live=2048     old      76.1 us  new     52.2 us  ctl     52.1 us  speedup   1.46x  ctl-spread -0.10%  (old rounds 75.6-77.1, new 51.5-52.2)
+[time] EAGLE3 attn-module bs=1 R=2048 live=2048     old     253.4 us  new    221.1 us  ctl    224.0 us  speedup   1.15x  ctl-spread +1.27%  (old rounds 250.2-257.3, new 219.9-223.9)
+[bench] eagle3 bs=1 2048/2048 attempt 1 rc=137
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=2048/2048
+[time] EAGLE3 attn-core   bs=1 R=2048 live=2048     old      75.9 us  new     52.0 us  ctl     51.9 us  speedup   1.46x  ctl-spread -0.19%  (old rounds 75.4-78.2, new 51.5-52.1)
+[time] EAGLE3 attn-module bs=1 R=2048 live=2048     old     252.8 us  new    220.3 us  ctl    223.8 us  speedup   1.15x  ctl-spread +1.56%  (old rounds 249.7-256.6, new 219.4-223.3)
+[time] EAGLE3 propose(6 steps) bs=1 R=2048 live=2048 old    5323.9 us  new   5048.5 us  ctl   5048.9 us  speedup   1.05x  ctl-spread +0.01%  (old rounds 5322.0-5328.6, new 5045.3-5050.8)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[time] EAGLE3 attn-core   bs=1 R=8192 live=8192     old     165.2 us  new     70.8 us  ctl     70.7 us  speedup   2.33x  ctl-spread -0.09%  (old rounds 164.5-165.7, new 70.6-70.8)
+[time] EAGLE3 attn-module bs=1 R=8192 live=8192     old     357.6 us  new    234.8 us  ctl    234.6 us  speedup   1.52x  ctl-spread -0.07%  (old rounds 354.5-363.2, new 232.7-239.2)
+[bench] eagle3 bs=1 8192/8192 attempt 1 rc=139
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[time] EAGLE3 attn-core   bs=1 R=8192 live=8192     old     165.0 us  new     70.7 us  ctl     70.7 us  speedup   2.33x  ctl-spread +0.00%  (old rounds 164.4-165.2, new 70.6-70.8)
+[time] EAGLE3 attn-module bs=1 R=8192 live=8192     old     357.3 us  new    234.6 us  ctl    234.5 us  speedup   1.52x  ctl-spread -0.04%  (old rounds 354.0-362.6, new 232.5-239.7)
+[time] EAGLE3 propose(6 steps) bs=1 R=8192 live=8192 old    5821.2 us  new   5193.5 us  ctl   5193.3 us  speedup   1.12x  ctl-spread -0.00%  (old rounds 5820.0-5823.7, new 5192.4-5195.2)
+[bench] eagle3 bs=1 8192/8192 attempt 2 rc=134
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[time] EAGLE3 attn-core   bs=1 R=8192 live=8192     old     165.1 us  new     70.6 us  ctl     70.6 us  speedup   2.34x  ctl-spread +0.04%  (old rounds 164.4-165.1, new 70.5-71.0)
+[time] EAGLE3 attn-module bs=1 R=8192 live=8192     old     365.2 us  new    235.7 us  ctl    237.0 us  speedup   1.55x  ctl-spread +0.56%  (old rounds 360.3-368.1, new 234.6-239.3)
+[time] EAGLE3 propose(6 steps) bs=1 R=8192 live=8192 old    5822.3 us  new   5197.1 us  ctl   5196.2 us  speedup   1.12x  ctl-spread -0.02%  (old rounds 5819.9-5823.3, new 5195.2-5198.8)
+[bench] eagle3 bs=1 8192/8192 attempt 3 rc=139
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      51.0 us  new     43.0 us  ctl     43.0 us  speedup   1.19x  ctl-spread -0.02%  (old rounds 50.3-51.2, new 42.7-43.2)
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     217.0 us  new    207.5 us  ctl    207.3 us  speedup   1.05x  ctl-spread -0.08%  (old rounds 214.4-218.7, new 205.1-209.1)
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=64   old    5086.5 us  new   4970.1 us  ctl   4970.7 us  speedup   1.02x  ctl-spread +0.01%  (old rounds 5086.3-5091.1, new 4969.5-4972.3)
+[bench] eagle3 bs=1 512/64 attempt 1 rc=134
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      51.1 us  new     43.2 us  ctl     43.2 us  speedup   1.18x  ctl-spread -0.03%  (old rounds 50.4-51.4, new 42.7-43.3)
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     216.9 us  new    207.8 us  ctl    207.4 us  speedup   1.04x  ctl-spread -0.17%  (old rounds 214.5-218.9, new 205.5-209.5)
+[bench] eagle3 bs=1 512/64 attempt 2 rc=134
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      51.1 us  new     43.3 us  ctl     43.4 us  speedup   1.18x  ctl-spread +0.20%  (old rounds 50.4-51.4, new 42.7-43.3)
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     216.7 us  new    207.5 us  ctl    207.3 us  speedup   1.04x  ctl-spread -0.10%  (old rounds 214.1-218.9, new 205.0-208.7)
+[bench] eagle3 bs=1 512/64 attempt 3 rc=134
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=512/512
+[time] EAGLE3 attn-core   bs=4 R=512 live=512       old      89.7 us  new     64.7 us  ctl     64.8 us  speedup   1.39x  ctl-spread +0.21%  (old rounds 89.7-90.6, new 64.0-65.1)
+[time] EAGLE3 attn-module bs=4 R=512 live=512       old     264.0 us  new    229.1 us  ctl    229.6 us  speedup   1.15x  ctl-spread +0.19%  (old rounds 261.1-266.8, new 227.9-232.5)
+[time] EAGLE3 propose(6 steps) bs=4 R=512 live=512  old    5467.0 us  new   5118.3 us  ctl   5120.1 us  speedup   1.07x  ctl-spread +0.04%  (old rounds 5464.9-5468.0, new 5114.3-5118.7)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[time] EAGLE3 attn-core   bs=4 R=2048 live=2048     old     229.4 us  new     70.3 us  ctl     70.3 us  speedup   3.27x  ctl-spread +0.13%  (old rounds 228.6-232.7, new 70.2-70.4)
+[time] EAGLE3 attn-module bs=4 R=2048 live=2048     old     448.6 us  new    232.0 us  ctl    232.3 us  speedup   1.93x  ctl-spread +0.13%  (old rounds 444.4-450.9, new 229.8-236.8)
+[bench] eagle3 bs=4 2048/2048 attempt 1 rc=139
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[time] EAGLE3 attn-core   bs=4 R=2048 live=2048     old     229.4 us  new     70.2 us  ctl     70.2 us  speedup   3.27x  ctl-spread +0.03%  (old rounds 228.2-229.5, new 70.1-70.3)
+[time] EAGLE3 attn-module bs=4 R=2048 live=2048     old     447.2 us  new    231.8 us  ctl    232.0 us  speedup   1.93x  ctl-spread +0.09%  (old rounds 442.9-449.2, new 229.5-236.7)
+[time] EAGLE3 propose(6 steps) bs=4 R=2048 live=2048 old    6352.0 us  new   5142.4 us  ctl   5142.8 us  speedup   1.24x  ctl-spread +0.01%  (old rounds 6350.7-6355.1, new 5141.0-5143.3)
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=8192/8192
+[time] EAGLE3 attn-core   bs=4 R=8192 live=8192     old    1069.3 us  new    142.0 us  ctl    140.9 us  speedup   7.53x  ctl-spread -0.76%  (old rounds 1061.7-1082.3, new 140.2-142.8)
+[time] EAGLE3 attn-module bs=4 R=8192 live=8192     old    1256.5 us  new    363.0 us  ctl    364.3 us  speedup   3.46x  ctl-spread +0.37%  (old rounds 1256.2-1257.6, new 362.8-363.3)
+[time] EAGLE3 propose(6 steps) bs=4 R=8192 live=8192 old   11235.5 us  new   5799.9 us  ctl   5800.7 us  speedup   1.94x  ctl-spread +0.01%  (old rounds 11232.6-11238.9, new 5798.6-5801.2)
+[result] PASS

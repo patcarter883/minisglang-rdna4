@@ -1,0 +1,224 @@
+gpu-lease: leased card(s) [1] as 'gpu1'  (HIP=0, port=8001, project=lease-gpu1)
+W20260924 07:35:02.641182 140166227316864 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp', 'eagle3'] PARITY=True TIMING=False BS=1,4 CASES=all
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[parity] MTP round 0 step 0: attn max|d| 4.883e-04 (rel 7.47e-04)  logits max|d| 1.866e-01 (rel 4.18e-03)  argmax agree [True, True, True, True]  live keys [40, 100, 510, 510]
+[parity] MTP round 0 step 1: attn max|d| 1.465e-03 (rel 2.79e-03)  logits max|d| 9.191e-01 (rel 2.07e-02)  argmax agree [True, True, True, True]  live keys [41, 101, 511, 511]
+[parity] MTP round 0 step 2: attn max|d| 7.568e-03 (rel 1.45e-02)  logits max|d| 4.426e-01 (rel 1.23e-02)  argmax agree [True, True, True, True]  live keys [42, 102, 512, 512]
+[parity] MTP round 1 step 0: attn max|d| 2.441e-04 (rel 5.41e-04)  logits max|d| 3.451e-01 (rel 8.37e-03)  argmax agree [True, True, True, True]  live keys [41, 102, 510, 510]
+[parity] MTP round 1 step 1: attn max|d| 1.221e-03 (rel 2.28e-03)  logits max|d| 9.997e-01 (rel 2.32e-02)  argmax agree [True, True, True, True]  live keys [42, 103, 511, 511]
+[parity] MTP round 1 step 2: attn max|d| 4.578e-03 (rel 8.49e-03)  logits max|d| 3.866e-01 (rel 9.54e-03)  argmax agree [True, False, True, True]  live keys [43, 104, 512, 512]
+[parity] MTP round 2 step 0: attn max|d| 3.662e-04 (rel 6.57e-04)  logits max|d| 1.680e-01 (rel 4.43e-03)  argmax agree [True, True, True, True]  live keys [44, 103, 510, 510]
+[parity] MTP round 2 step 1: attn max|d| 9.766e-04 (rel 1.64e-03)  logits max|d| 3.697e-01 (rel 8.31e-03)  argmax agree [True, True, True, True]  live keys [45, 104, 511, 511]
+[parity] MTP round 2 step 2: attn max|d| 1.099e-03 (rel 1.96e-03)  logits max|d| 1.539e+00 (rel 3.29e-02)  argmax agree [True, True, True, True]  live keys [46, 105, 512, 512]
+[parity] MTP SUMMARY: worst attn max|d| 7.568e-03 (rel 1.45e-02), worst logits max|d| 1.539e+00 (rel 3.29e-02); drafted argmax agreement teacher-forced 24/24, free-running 24/24
+[graph] MTP: eager == graph replay (drafts, last logits, last hidden) bit-identical: YES; drafts [[96054, 96054, 154822], [96054, 89620, 154822], [154822, 154822, 7003], [23751, 154822, 61327]]
+[load] EAGLE3 drafter 16q/4kv x 128
+[parity] EAGLE3 round 0 step 0: attn max|d| 1.953e-03 (rel 1.20e-04)  logits max|d| 7.812e-03 (rel 7.81e-04)  argmax agree [True, True, True, True]  live keys [40, 100, 507, 507]
+[parity] EAGLE3 round 0 step 1: attn max|d| 3.906e-03 (rel 2.31e-04)  logits max|d| 7.812e-03 (rel 8.26e-04)  argmax agree [True, True, True, True]  live keys [41, 101, 508, 508]
+[parity] EAGLE3 round 0 step 2: attn max|d| 1.953e-03 (rel 1.16e-04)  logits max|d| 3.906e-03 (rel 3.67e-04)  argmax agree [True, True, True, True]  live keys [42, 102, 509, 509]
+[parity] EAGLE3 round 0 step 3: attn max|d| 1.953e-03 (rel 1.36e-04)  logits max|d| 5.859e-03 (rel 4.94e-04)  argmax agree [True, True, True, True]  live keys [43, 103, 510, 510]
+[parity] EAGLE3 round 0 step 4: attn max|d| 1.953e-03 (rel 1.40e-04)  logits max|d| 7.812e-03 (rel 6.13e-04)  argmax agree [True, True, True, True]  live keys [44, 104, 511, 511]
+[parity] EAGLE3 round 0 step 5: attn max|d| 7.812e-03 (rel 6.16e-04)  logits max|d| 7.812e-03 (rel 5.83e-04)  argmax agree [True, True, True, True]  live keys [45, 105, 512, 512]
+[parity] EAGLE3 round 1 step 0: attn max|d| 1.953e-03 (rel 9.63e-05)  logits max|d| 3.906e-03 (rel 3.60e-04)  argmax agree [True, True, True, True]  live keys [41, 102, 507, 507]
+[parity] EAGLE3 round 1 step 1: attn max|d| 7.812e-03 (rel 4.86e-04)  logits max|d| 7.812e-03 (rel 7.97e-04)  argmax agree [True, True, True, True]  live keys [42, 103, 508, 508]
+[parity] EAGLE3 round 1 step 2: attn max|d| 3.906e-03 (rel 2.57e-04)  logits max|d| 3.906e-03 (rel 3.64e-04)  argmax agree [True, True, True, True]  live keys [43, 104, 509, 509]
+[parity] EAGLE3 round 1 step 3: attn max|d| 7.812e-03 (rel 5.58e-04)  logits max|d| 4.883e-03 (rel 4.22e-04)  argmax agree [True, True, True, True]  live keys [44, 105, 510, 510]
+[parity] EAGLE3 round 1 step 4: attn max|d| 1.953e-03 (rel 1.46e-04)  logits max|d| 7.812e-03 (rel 6.34e-04)  argmax agree [True, True, True, True]  live keys [45, 106, 511, 511]
+[parity] EAGLE3 round 1 step 5: attn max|d| 1.953e-03 (rel 1.49e-04)  logits max|d| 7.812e-03 (rel 6.06e-04)  argmax agree [True, True, True, True]  live keys [46, 107, 512, 512]
+[parity] EAGLE3 round 2 step 0: attn max|d| 1.953e-03 (rel 1.19e-04)  logits max|d| 3.906e-03 (rel 3.26e-04)  argmax agree [True, True, True, True]  live keys [47, 103, 507, 507]
+[parity] EAGLE3 round 2 step 1: attn max|d| 3.906e-03 (rel 2.35e-04)  logits max|d| 3.906e-03 (rel 4.69e-04)  argmax agree [True, True, True, True]  live keys [48, 104, 508, 508]
+[parity] EAGLE3 round 2 step 2: attn max|d| 3.906e-03 (rel 2.31e-04)  logits max|d| 7.812e-03 (rel 7.91e-04)  argmax agree [True, True, True, True]  live keys [49, 105, 509, 509]
+[parity] EAGLE3 round 2 step 3: attn max|d| 3.906e-03 (rel 2.65e-04)  logits max|d| 7.812e-03 (rel 7.97e-04)  argmax agree [True, True, True, True]  live keys [50, 106, 510, 510]
+[parity] EAGLE3 round 2 step 4: attn max|d| 1.953e-03 (rel 1.36e-04)  logits max|d| 7.812e-03 (rel 7.56e-04)  argmax agree [True, True, True, True]  live keys [51, 107, 511, 511]
+[parity] EAGLE3 round 2 step 5: attn max|d| 1.953e-03 (rel 1.38e-04)  logits max|d| 7.812e-03 (rel 7.00e-04)  argmax agree [True, True, True, True]  live keys [52, 108, 512, 512]
+[parity] EAGLE3 SUMMARY: worst attn max|d| 7.812e-03 (rel 6.16e-04), worst logits max|d| 7.812e-03 (rel 8.26e-04); drafted argmax agreement teacher-forced 72/72, free-running 72/72
+[graph] EAGLE3: eager == graph replay (drafts, last logits, last hidden) bit-identical: YES; drafts [[1782, 3093, 68275, 68275, 68275, 68275], [315, 35683, 315, 68275, 68275, 68275], [315, 68275, 68275, 68275, 68275, 68275], [1039, 85016, 19877, 19877, 19877, 19877]]
+[result] PASS
+W20260924 07:35:16.532721 140429315039360 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=512/512
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=1 R=512 live=512          old      76.3 us  new     72.5 us  ctl     72.5 us  speedup   1.05x  ctl-spread +0.01%  (old rounds 76.1-81.2, new 72.0-72.5)
+[time] MTP attn-module bs=1 R=512 live=512          old     224.4 us  new    203.2 us  ctl    204.0 us  speedup   1.10x  ctl-spread +0.38%  (old rounds 222.3-226.1, new 202.5-205.3)
+[time] MTP propose(3 steps) bs=1 R=512 live=512     old    3971.6 us  new   3913.1 us  ctl   3915.0 us  speedup   1.01x  ctl-spread +0.05%  (old rounds 3971.1-3973.4, new 3912.5-3914.1)
+[result] PASS
+W20260924 07:35:46.297412 140133986144384 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=2048/2048
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=1 R=2048 live=2048        old     156.3 us  new     82.8 us  ctl     82.8 us  speedup   1.89x  ctl-spread +0.02%  (old rounds 155.7-162.2, new 82.4-83.0)
+[time] MTP attn-module bs=1 R=2048 live=2048        old     305.8 us  new    217.0 us  ctl    217.9 us  speedup   1.41x  ctl-spread +0.41%  (old rounds 304.5-309.4, new 216.2-219.4)
+[time] MTP propose(3 steps) bs=1 R=2048 live=2048   old    4296.1 us  new   3951.4 us  ctl   3923.6 us  speedup   1.09x  ctl-spread -0.70%  (old rounds 4295.8-4296.5, new 3951.2-3951.9)
+[result] PASS
+W20260924 07:36:16.736892 139801141641344 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=1 R=8192 live=8192        old     584.7 us  new    125.0 us  ctl    125.9 us  speedup   4.68x  ctl-spread +0.71%  (old rounds 579.2-591.2, new 124.2-127.3)
+[time] MTP attn-module bs=1 R=8192 live=8192        old     734.4 us  new    254.2 us  ctl    261.3 us  speedup   2.89x  ctl-spread +2.82%  (old rounds 734.0-737.0, new 253.4-262.6)
+bash: line 1:     9 Segmentation fault      (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 07:36:36.853137 140396113252480 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=1 R=8192 live=8192        old     583.7 us  new    125.3 us  ctl    125.8 us  speedup   4.66x  ctl-spread +0.43%  (old rounds 578.3-589.4, new 124.3-127.5)
+[time] MTP attn-module bs=1 R=8192 live=8192        old     735.7 us  new    254.4 us  ctl    261.6 us  speedup   2.89x  ctl-spread +2.84%  (old rounds 735.5-739.0, new 253.4-262.9)
+[time] MTP propose(3 steps) bs=1 R=8192 live=8192   old    5556.6 us  new   4066.5 us  ctl   4065.7 us  speedup   1.37x  ctl-spread -0.02%  (old rounds 5555.7-5557.5, new 4065.2-4068.2)
+[result] PASS
+W20260924 07:37:11.296502 140673376399488 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=1 R=512 live=64           old      76.3 us  new     69.1 us  ctl     69.1 us  speedup   1.11x  ctl-spread +0.06%  (old rounds 76.3-81.1, new 68.0-69.1)
+[time] MTP attn-module bs=1 R=512 live=64           old     224.3 us  new    200.0 us  ctl    200.6 us  speedup   1.12x  ctl-spread +0.32%  (old rounds 222.8-226.1, new 199.0-201.7)
+[time] MTP propose(3 steps) bs=1 R=512 live=64      old    3954.2 us  new   3908.3 us  ctl   3901.0 us  speedup   1.01x  ctl-spread -0.19%  (old rounds 3954.1-3957.4, new 3908.1-3908.4)
+[result] PASS
+W20260924 07:37:40.796436 140055974772864 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=512/512
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=4 R=512 live=512          old     191.2 us  new     85.3 us  ctl     85.5 us  speedup   2.24x  ctl-spread +0.28%  (old rounds 190.4-196.8, new 85.1-85.4)
+[time] MTP attn-module bs=4 R=512 live=512          old     363.9 us  new    246.7 us  ctl    247.5 us  speedup   1.48x  ctl-spread +0.34%  (old rounds 360.2-368.5, new 246.1-248.6)
+[time] MTP propose(3 steps) bs=4 R=512 live=512     old    5167.3 us  new   4745.2 us  ctl   4747.3 us  speedup   1.09x  ctl-spread +0.04%  (old rounds 5161.7-5170.8, new 4742.7-4746.7)
+[result] PASS
+W20260924 07:38:15.522487 139765413806208 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=4 R=2048 live=2048        old    1165.0 us  new    121.0 us  ctl    121.0 us  speedup   9.63x  ctl-spread +0.06%  (old rounds 1156.1-1183.5, new 120.6-122.3)
+[time] MTP attn-module bs=4 R=2048 live=2048        old    1342.2 us  new    275.8 us  ctl    275.5 us  speedup   4.87x  ctl-spread -0.10%  (old rounds 1341.2-1342.8, new 275.5-276.0)
+GPU coredump: execvp failed: No such file or directory
+Failed to write segment data to pipe: Broken pipe
+GPU coredump: handler exited with error (status: 1)
+GPU core dump failed
+VGPU(0x20940550) Queue(0x7f1be8015000) is idle
+VGPU(0x3afa1b90) Queue(0x7f1be8015000) is idle
+:0:rocdevice.cpp            :3586: 108693696928 us:  Callback: Queue 0x7f1ac1600000 aborting with error : HSA_STATUS_ERROR_EXCEPTION: An HSAIL operation resulted in a hardware exception. code: 0x1016
+bash: line 1:     9 Aborted                 (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 07:38:57.434896 139719206019200 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=4 R=2048 live=2048        old    1160.6 us  new    120.8 us  ctl    121.1 us  speedup   9.60x  ctl-spread +0.21%  (old rounds 1151.9-1180.4, new 120.6-121.9)
+[time] MTP attn-module bs=4 R=2048 live=2048        old    1343.5 us  new    275.8 us  ctl    275.5 us  speedup   4.87x  ctl-spread -0.12%  (old rounds 1342.3-1344.0, new 275.3-275.9)
+[time] MTP propose(3 steps) bs=4 R=2048 live=2048   old    7921.7 us  new   4800.3 us  ctl   4794.0 us  speedup   1.65x  ctl-spread -0.13%  (old rounds 7920.9-7928.5, new 4794.2-4804.9)
+[result] PASS
+W20260924 07:39:39.916375 139859770974336 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=8192/8192
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=4 R=8192 live=8192        old    5678.3 us  new    263.1 us  ctl    265.2 us  speedup  21.58x  ctl-spread +0.79%  (old rounds 5673.6-5733.0, new 262.6-266.2)
+[time] MTP attn-module bs=4 R=8192 live=8192        old    5876.7 us  new    426.3 us  ctl    433.9 us  speedup  13.78x  ctl-spread +1.77%  (old rounds 5875.9-5877.0, new 426.1-433.9)
+[time] MTP propose(3 steps) bs=4 R=8192 live=8192   old   21534.5 us  new   5221.0 us  ctl   5222.1 us  speedup   4.12x  ctl-spread +0.02%  (old rounds 21530.0-21536.4, new 5220.4-5223.7)
+[result] PASS
+W20260924 07:41:01.293378 140639409225856 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=512/64
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[time] MTP attn-core   bs=4 R=512 live=64           old     191.0 us  new     75.9 us  ctl     75.9 us  speedup   2.52x  ctl-spread +0.00%  (old rounds 190.2-196.1, new 75.8-76.0)
+[time] MTP attn-module bs=4 R=512 live=64           old     364.6 us  new    235.3 us  ctl    236.3 us  speedup   1.55x  ctl-spread +0.43%  (old rounds 361.3-369.3, new 234.0-237.8)
+[time] MTP propose(3 steps) bs=4 R=512 live=64      old    5164.6 us  new   4708.1 us  ctl   4710.0 us  speedup   1.10x  ctl-spread +0.04%  (old rounds 5164.0-5171.1, new 4706.2-4708.3)
+[result] PASS
+W20260924 07:41:35.755172 140270356390016 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/512
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=512 live=512       old      51.1 us  new     64.3 us  ctl     64.2 us  speedup   0.79x  ctl-spread -0.12%  (old rounds 50.8-51.3, new 63.4-65.0)
+[time] EAGLE3 attn-module bs=1 R=512 live=512       old     216.6 us  new    228.0 us  ctl    227.5 us  speedup   0.95x  ctl-spread -0.21%  (old rounds 214.0-219.4, new 225.0-230.8)
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=512  old    5090.6 us  new   5114.8 us  ctl   5113.3 us  speedup   1.00x  ctl-spread -0.03%  (old rounds 5089.6-5091.3, new 5113.3-5116.9)
+[result] PASS
+W20260924 07:42:09.764470 140192605724800 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=2048/2048
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=2048 live=2048     old      76.1 us  new     52.2 us  ctl     52.1 us  speedup   1.46x  ctl-spread -0.10%  (old rounds 75.6-77.1, new 51.5-52.2)
+[time] EAGLE3 attn-module bs=1 R=2048 live=2048     old     253.4 us  new    221.1 us  ctl    224.0 us  speedup   1.15x  ctl-spread +1.27%  (old rounds 250.2-257.3, new 219.9-223.9)
+W20260924 08:00:49.278101 140388601249920 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=2048/2048
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=2048 live=2048     old      75.9 us  new     52.0 us  ctl     51.9 us  speedup   1.46x  ctl-spread -0.19%  (old rounds 75.4-78.2, new 51.5-52.1)
+[time] EAGLE3 attn-module bs=1 R=2048 live=2048     old     252.8 us  new    220.3 us  ctl    223.8 us  speedup   1.15x  ctl-spread +1.56%  (old rounds 249.7-256.6, new 219.4-223.3)
+[time] EAGLE3 propose(6 steps) bs=1 R=2048 live=2048 old    5323.9 us  new   5048.5 us  ctl   5048.9 us  speedup   1.05x  ctl-spread +0.01%  (old rounds 5322.0-5328.6, new 5045.3-5050.8)
+[result] PASS
+W20260924 08:01:23.774456 139637333270656 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=8192 live=8192     old     165.2 us  new     70.8 us  ctl     70.7 us  speedup   2.33x  ctl-spread -0.09%  (old rounds 164.5-165.7, new 70.6-70.8)
+[time] EAGLE3 attn-module bs=1 R=8192 live=8192     old     357.6 us  new    234.8 us  ctl    234.6 us  speedup   1.52x  ctl-spread -0.07%  (old rounds 354.5-363.2, new 232.7-239.2)
+bash: line 1:     9 Segmentation fault      (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 08:01:38.409962 139702784426112 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=8192 live=8192     old     165.0 us  new     70.7 us  ctl     70.7 us  speedup   2.33x  ctl-spread +0.00%  (old rounds 164.4-165.2, new 70.6-70.8)
+[time] EAGLE3 attn-module bs=1 R=8192 live=8192     old     357.3 us  new    234.6 us  ctl    234.5 us  speedup   1.52x  ctl-spread -0.04%  (old rounds 354.0-362.6, new 232.5-239.7)
+[time] EAGLE3 propose(6 steps) bs=1 R=8192 live=8192 old    5821.2 us  new   5193.5 us  ctl   5193.3 us  speedup   1.12x  ctl-spread -0.00%  (old rounds 5820.0-5823.7, new 5192.4-5195.2)
+free(): invalid pointer
+bash: line 1:     9 Aborted                 (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 08:02:19.124436 139756281745536 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=8192/8192
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=8192 live=8192     old     165.1 us  new     70.6 us  ctl     70.6 us  speedup   2.34x  ctl-spread +0.04%  (old rounds 164.4-165.1, new 70.5-71.0)
+[time] EAGLE3 attn-module bs=1 R=8192 live=8192     old     365.2 us  new    235.7 us  ctl    237.0 us  speedup   1.55x  ctl-spread +0.56%  (old rounds 360.3-368.1, new 234.6-239.3)
+[time] EAGLE3 propose(6 steps) bs=1 R=8192 live=8192 old    5822.3 us  new   5197.1 us  ctl   5196.2 us  speedup   1.12x  ctl-spread -0.02%  (old rounds 5819.9-5823.3, new 5195.2-5198.8)
+bash: line 1:     9 Segmentation fault      (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 08:02:59.158591 139960210616448 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      51.0 us  new     43.0 us  ctl     43.0 us  speedup   1.19x  ctl-spread -0.02%  (old rounds 50.3-51.2, new 42.7-43.2)
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     217.0 us  new    207.5 us  ctl    207.3 us  speedup   1.05x  ctl-spread -0.08%  (old rounds 214.4-218.7, new 205.1-209.1)
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=64   old    5086.5 us  new   4970.1 us  ctl   4970.7 us  speedup   1.02x  ctl-spread +0.01%  (old rounds 5086.3-5091.1, new 4969.5-4972.3)
+terminate called after throwing an instance of 'c10::Error'
+  what():  erased == erased_by_addr INTERNAL ASSERT FAILED at "/__w/pytorch/pytorch/c10/hip/HIPCachingAllocator.cpp":308, please report a bug to PyTorch. 
+Exception raised from erase_from_blocks at /__w/pytorch/pytorch/c10/hip/HIPCachingAllocator.cpp:308 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x7f4a5aa3b47d in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, char const*) + 0x69 (0x7f4a5a9c7815 in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #2: <unknown function> + 0x22bef (0x7f4acdfa1bef in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10_hip.so)
+frame #3: <unknown function> + 0x2615c (0x7f4acdfa515c in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10_hip.so)
+frame #4: <unknown function> + 0x290f0 (0x7f4acdfa80f0 in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10_hip.so)
+frame #5: <unknown function> + 0x2ad0b (0x7f4acdfa9d0b in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10_hip.so)
+frame #6: <unknown function> + 0x2b4be (0x7f4acdfaa4be in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10_hip.so)
+frame #7: <unknown function> + 0x88aa4 (0x7f4a5aa19aa4 in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #8: c10::TensorImpl::~TensorImpl() + 0x9 (0x7f4a5aa135c9 in /opt/venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #9: <unknown function> + 0x8a4e75 (0x7f4b04d2fe75 in /opt/venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #10: <unknown function> + 0x8a4f01 (0x7f4b04d2ff01 in /opt/venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #11: python() [0x59f273]
+frame #12: python() [0x5916d2]
+frame #13: python() [0x54c835]
+frame #14: python() [0x5f7949]
+frame #15: python() [0x5e3264]
+<omitting python frames>
+frame #18: python() [0x608852]
+frame #19: python() [0x6b50d3]
+frame #24: <unknown function> + 0x2a1ca (0x7f4b06a5a1ca in /lib/x86_64-linux-gnu/libc.so.6)
+frame #25: __libc_start_main + 0x8b (0x7f4b06a5a28b in /lib/x86_64-linux-gnu/libc.so.6)
+
+bash: line 1:     9 Aborted                 (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 08:03:37.122810 140613461381248 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      51.1 us  new     43.2 us  ctl     43.2 us  speedup   1.18x  ctl-spread -0.03%  (old rounds 50.4-51.4, new 42.7-43.3)
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     216.9 us  new    207.8 us  ctl    207.4 us  speedup   1.04x  ctl-spread -0.17%  (old rounds 214.5-218.9, new 205.5-209.5)
+double free or corruption (out)
+bash: line 1:     9 Aborted                 (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 08:03:50.914590 139691415879808 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      51.1 us  new     43.3 us  ctl     43.4 us  speedup   1.18x  ctl-spread +0.20%  (old rounds 50.4-51.4, new 42.7-43.3)
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     216.7 us  new    207.5 us  ctl    207.3 us  speedup   1.04x  ctl-spread -0.10%  (old rounds 214.1-218.9, new 205.0-208.7)
+free(): invalid pointer
+bash: line 1:     9 Aborted                 (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 08:04:04.681248 140454409277568 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=512/512
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=4 R=512 live=512       old      89.7 us  new     64.7 us  ctl     64.8 us  speedup   1.39x  ctl-spread +0.21%  (old rounds 89.7-90.6, new 64.0-65.1)
+[time] EAGLE3 attn-module bs=4 R=512 live=512       old     264.0 us  new    229.1 us  ctl    229.6 us  speedup   1.15x  ctl-spread +0.19%  (old rounds 261.1-266.8, new 227.9-232.5)
+[time] EAGLE3 propose(6 steps) bs=4 R=512 live=512  old    5467.0 us  new   5118.3 us  ctl   5120.1 us  speedup   1.07x  ctl-spread +0.04%  (old rounds 5464.9-5468.0, new 5114.3-5118.7)
+[result] PASS
+W20260924 08:04:39.589705 140293968027776 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=4 R=2048 live=2048     old     229.4 us  new     70.3 us  ctl     70.3 us  speedup   3.27x  ctl-spread +0.13%  (old rounds 228.6-232.7, new 70.2-70.4)
+[time] EAGLE3 attn-module bs=4 R=2048 live=2048     old     448.6 us  new    232.0 us  ctl    232.3 us  speedup   1.93x  ctl-spread +0.13%  (old rounds 444.4-450.9, new 229.8-236.8)
+bash: line 1:     9 Segmentation fault      (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+W20260924 08:04:54.862282 140698279755904 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=4 R=2048 live=2048     old     229.4 us  new     70.2 us  ctl     70.2 us  speedup   3.27x  ctl-spread +0.03%  (old rounds 228.2-229.5, new 70.1-70.3)
+[time] EAGLE3 attn-module bs=4 R=2048 live=2048     old     447.2 us  new    231.8 us  ctl    232.0 us  speedup   1.93x  ctl-spread +0.09%  (old rounds 442.9-449.2, new 229.5-236.7)
+[time] EAGLE3 propose(6 steps) bs=4 R=2048 live=2048 old    6352.0 us  new   5142.4 us  ctl   5142.8 us  speedup   1.24x  ctl-spread +0.01%  (old rounds 6350.7-6355.1, new 5141.0-5143.3)
+[result] PASS
+W20260924 08:05:31.755455 139785876476032 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+[env] card ROCR_VISIBLE_DEVICES=1 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=8192/8192
+[load] EAGLE3 drafter 16q/4kv x 128
+[time] EAGLE3 attn-core   bs=4 R=8192 live=8192     old    1069.3 us  new    142.0 us  ctl    140.9 us  speedup   7.53x  ctl-spread -0.76%  (old rounds 1061.7-1082.3, new 140.2-142.8)
+[time] EAGLE3 attn-module bs=4 R=8192 live=8192     old    1256.5 us  new    363.0 us  ctl    364.3 us  speedup   3.46x  ctl-spread +0.37%  (old rounds 1256.2-1257.6, new 362.8-363.3)
+Terminated                 "${cmd[@]}" 2>&1 | tee "$logfile"

@@ -15,8 +15,9 @@ Architecture (config.json: model_type=llama, LlamaForCausalLMEagle3, hidden=2048
   - d2t [32000] (delta): target_id = draft_id + d2t[draft_id]; t2d is the inverse membership mask
     (loaded but unused at inference — the proposer maps draft->target ids via d2t).
 
-The chain is run with a tiny per-request causal cache (built fresh each propose, like GLMMTPAttention
-.forward_draft) — it never touches the engine's paged KV. Step 0 fuses the captured target aux +
+The chain attends over a persistent per-slot draft-KV RING owned by the proposer (spec/draft_model.py),
+read IN PLACE by the attn_decode.flash_decode_paged HIP kernel (spec/draft_attn.py) — it never touches
+the engine's paged KV. Step 0 fuses the captured target aux +
 the confirmed token's embedding; subsequent steps feed the draft's OWN output hidden + the new draft
 token's embedding (standard EAGLE3 autoregression). See spec/draft_model.py for the loop and the
 d2t / target-vocab mapping.
@@ -27,7 +28,9 @@ from typing import List, Tuple
 
 import torch
 from minisgl.layers import RMSNorm, get_rope, silu_and_mul
+from minisgl._hip_engage import engaged
 from minisgl.layers.base import BaseOP
+from minisgl.spec.draft_attn import paged_draft_attention
 
 
 # The drafter linear now lives in ONE place (models/draft_linear.py), shared by every draft trunk.
@@ -131,61 +134,7 @@ class GLMEagle3DraftModel(BaseOP):
         up = self.up_proj.forward(x)
         return self.down_proj.forward(silu_and_mul(torch.cat([gate, up], dim=-1)))
 
-    def step(
-        self,
-        embed_e: torch.Tensor,
-        hidden: torch.Tensor,
-        positions: torch.Tensor,
-        cache: List,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One autoregressive EAGLE3 draft step over all B requests.
-
-        embed_e:   [B, hidden]  the embedding of THIS step's input token.
-        hidden:    [B, hidden]  the previous-feature hidden — for step 0 this is fc(aux) (the fused
-                   target feature); for later steps it is the draft's OWN output hidden. It is BOTH
-                   the hidden_norm branch input AND the block residual (standard llama_eagle3: the
-                   midlayer's residual is its hidden-state input).
-        positions: [B] absolute RoPE positions.
-        cache:     list growing per step; each entry (k [B,Hkv,hd], v [B,Hkv,hd]).
-        Returns (draft_logits [B, draft_vocab], output_hidden [B, hidden]) — output_hidden feeds the
-        NEXT step's hidden + the head produces the draft token.
-        """
-        B = embed_e.shape[0]
-        H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
-
-        widened = self._widened(embed_e, hidden)  # [B, 2*hidden]
-
-        q = self.q_proj.forward(widened).view(B, H, hd)
-        k = self.k_proj.forward(widened).view(B, Hkv, hd)
-        v = self.v_proj.forward(widened).view(B, Hkv, hd)
-
-        # Full RoPE over head_dim. The shared rotary applies to q (H heads) and k (Hkv heads) jointly.
-        q_flat, k_flat = self.rotary.forward(
-            positions, q.reshape(B, H * hd).contiguous(), k.reshape(B, Hkv * hd).contiguous()
-        )
-        q = q_flat.view(B, H, hd)
-        k = k_flat.view(B, Hkv, hd)
-
-        cache.append((k, v))
-        group = H // Hkv
-        Ks = torch.stack([c[0] for c in cache], dim=0)  # [S, B, Hkv, hd]
-        Vs = torch.stack([c[1] for c in cache], dim=0)  # [S, B, Hkv, hd]
-        Ks = Ks.repeat_interleave(group, dim=2)  # [S, B, H, hd]
-        Vs = Vs.repeat_interleave(group, dim=2)  # [S, B, H, hd]
-        # scores[b,h,s] = q[b,h]·k[s,b,h]; attend keys 0..step (causal, current included).
-        scores = torch.einsum("bhd,sbhd->bhs", q, Ks) * self.scale  # [B, H, S]
-        probs = scores.softmax(dim=-1).to(Vs.dtype)
-        attn = torch.einsum("bhs,sbhd->bhd", probs, Vs)  # [B, H, hd]
-        attn_out = self.o_proj.forward(attn.reshape(B, H * hd))  # [B, hidden]
-
-        # Llama post-norm residual: residual = hidden (the midlayer's hidden input).
-        residual = hidden + attn_out
-        normed = self.post_attention_layernorm.forward(residual)
-        out_hidden = residual + self._mlp(normed)  # [B, hidden]
-        logits = self.lm_head.forward(self.norm.forward(out_hidden))  # [B, draft_vocab]
-        return logits, out_hidden
-
-    # ---- CUDA-graph-capturable twins of step()/seed_kv() (see spec/capture.py) -------------------
+    # ---- the capturable draft step + prompt seed (see spec/capture.py) --------------------------
     def draft_buffer_dims(self) -> Tuple[int, int, int, int]:
         """(n_k_heads, k_dim, n_v_heads, v_dim) for the shared propose draft-KV buffer. Llama GQA:
         nkv heads with a symmetric head_dim for both K and V."""
@@ -206,23 +155,25 @@ class GLMEagle3DraftModel(BaseOP):
         v_buf: torch.Tensor,       # [max_slots, max_ctx, Hkv, hd] GLOBAL persistent draft V
         slot_rows: torch.Tensor,   # [B] which global slot (= req.table_idx) each row uses
         write_col: torch.Tensor,   # [B] column this token is written at, per row
-        mask_bias: torch.Tensor,   # [B, max_ctx] additive: 0 for cols <= write_col, -inf beyond
+        meta,                      # spec.draft_attn.DraftAttnMeta: block_table [B,R] i32, ctx_lens [B] i32
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CUDA-graph-capturable equivalent of ``step``: fixed-shape masked attention over a GLOBAL
-        persistent draft-KV buffer keyed by ``slot_rows``, instead of a ``torch.stack`` over a growing
-        Python list (a dynamic contraction dim AND a host-side list mutation — two capture blockers).
+        """One capturable autoregressive EAGLE3 draft step over all B rows.
 
-        Rows have DIFFERENT context lengths, which is exactly why one sliced tensor cannot serve the
-        batch: each row writes its k/v at its own ``write_col`` and attends the whole ``max_ctx``
-        window with ``-inf`` beyond it. ``softmax(-inf) == 0`` makes that arithmetically the same
-        attention as the sliced stack over the row's real prefix (validated per row by
-        tools/eagle3_masked_parity.py).
+        embed_e:   the embedding of THIS step's input token.
+        hidden:    the previous-feature hidden — fc(aux) at step 0, the draft's OWN output hidden after.
+                   It is BOTH the hidden_norm branch input AND the block residual (llama_eagle3).
+        Stores this token's k/v into the GLOBAL ring at (slot_rows, write_col), then GQA decode
+        attention over the row's visible keys on ``attn_decode.flash_decode_paged``: the ring is read
+        in place as page_size-1 pages, the block table / lengths (``meta``) are built on device by the
+        proposer from its keep mask, so the kernel reads exactly the keys the old additive -inf mask
+        kept — no ``k_buf[slot_rows]`` gather, no work sized from the ring's capacity.
+        Returns (draft_logits [B, draft_vocab], output_hidden [B, hidden]).
 
-        NOTE ON SCOPE, and it matters for how an A/B is read: unlike DFlash, EAGLE3 is NOT a
-        sliding-window drafter — ``step`` attends every cached key with no mask. So bounding the
-        buffer at ``max_ctx`` is a real (if lossless) change for prefixes longer than the window: the
-        drafts can differ. Losslessness comes from verify gating every emitted token, NOT from
-        byte-equality of the drafts. Gate an EAGLE3 change on accept-len at a stated window."""
+        NOTE ON SCOPE, and it matters for how an A/B is read: EAGLE3 is NOT a sliding-window drafter,
+        so bounding its context at the ring window is a real (if lossless) change for prefixes longer
+        than the window: the drafts can differ. Losslessness comes from verify gating every emitted
+        token, NOT from byte-equality of the drafts. Gate an EAGLE3 change on accept-len at a stated
+        window."""
         B = embed_e.shape[0]
         H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
         widened = self._widened(embed_e, hidden)
@@ -239,17 +190,8 @@ class GLMEagle3DraftModel(BaseOP):
         # the graph records the buffer pointer, the indices come from static tensors).
         k_buf[slot_rows, write_col] = k
         v_buf[slot_rows, write_col] = v
-        rep = H // Hkv
-        # GROUPED-query attention WITHOUT expanding K/V to H heads. The expansion would materialize
-        # [B, max_ctx, H, hd] inside the graph — rep x larger and charged to the graph's private pool
-        # permanently. Group q as [B, Hkv, rep, hd] and contract against the Hkv-head K/V instead.
-        qg = q.view(B, Hkv, rep, hd)
-        Ks = k_buf[slot_rows]                                 # [B, max_ctx, Hkv, hd]
-        Vs = v_buf[slot_rows]
-        scores = torch.einsum("bgrd,bsgd->bgrs", qg, Ks) * self.scale   # [B, Hkv, rep, max_ctx]
-        scores = scores + mask_bias.view(B, 1, 1, -1)
-        probs = scores.softmax(dim=-1).to(Vs.dtype)
-        attn = torch.einsum("bgrs,bsgd->bgrd", probs, Vs).reshape(B, H * hd)
+        engaged("attn_decode.flash_decode_paged(eagle3_draft)")
+        attn = paged_draft_attention(q, k_buf, v_buf, meta, self.scale).reshape(B, H * hd)
         attn_out = self.o_proj.forward(attn)
 
         residual = hidden + attn_out
@@ -269,49 +211,19 @@ class GLMEagle3DraftModel(BaseOP):
         slot: int,
         start_col: int = 0,
     ) -> None:
-        """Seed the GLOBAL draft-KV buffer from the prompt prefill, WITHOUT attention — the buffered
-        twin of ``seed_kv``. q/k/v + RoPE mirror ``step_masked`` exactly (via ``_widened``); only the
-        attention/MLP/head are dropped, which is a no-op for k/v storage."""
+        """Seed the GLOBAL draft-KV ring from the prompt prefill, WITHOUT attention. k/v + RoPE mirror
+        ``step_masked`` exactly (via ``_widened``); only the attention/MLP/head are dropped, which is a
+        no-op for k/v storage. Writes S rows at k_buf/v_buf[slot, start_col:start_col+S]."""
         S = embed_e.shape[0]
-        H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        Hkv, hd = self.num_kv_heads, self.head_dim
         widened = self._widened(embed_e, hidden)
-        k = self.k_proj.forward(widened).view(S, Hkv, hd)
+        k = self.k_proj.forward(widened)
         v = self.v_proj.forward(widened).view(S, Hkv, hd)
-        # The shared rotary rotates q (H heads) and k (Hkv heads) jointly; q is computed to satisfy
-        # the call and discarded (the seed stores k/v, not q).
-        q = self.q_proj.forward(widened).view(S, H, hd)
-        _, k_flat = self.rotary.forward(
-            positions, q.reshape(S, H * hd).contiguous(), k.reshape(S, Hkv * hd).contiguous()
-        )
+        # k rotated alone: forward_one is bit-identical to the key half of forward(), so no q
+        # projection is computed just to be discarded.
+        k_flat = self.rotary.forward_one(positions, k.contiguous())
         k_buf[slot, start_col : start_col + S] = k_flat.view(S, Hkv, hd)
         v_buf[slot, start_col : start_col + S] = v
-
-    @torch.inference_mode()
-    def seed_kv(
-        self, embed_e: torch.Tensor, hidden: torch.Tensor, positions: torch.Tensor
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """Compute per-position (k, v) for a batch of prompt positions WITHOUT attention — used to
-        SEED the persistent draft KV from the prompt prefill (DraftModelProposer.seed_prefill), so the
-        first draft sees full prompt context instead of a cold cache. The q/k/v projection MUST mirror
-        ``step`` exactly (keep in sync) — only the attention/MLP/head are dropped (the cache only stores
-        k/v; attention runs at propose time over the stacked cache).
-
-        embed_e/hidden: [S, hidden] (S = number of prompt positions seeded); positions: [S] RoPE pos.
-        Returns a list of S ``(k [1, Hkv, hd], v [1, Hkv, hd])`` entries — same shape/order ``step``
-        appends, so the proposer can stack them directly."""
-        S = embed_e.shape[0]
-        H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
-        widened = self._widened(embed_e, hidden)  # [S, 2*hidden]
-        k = self.k_proj.forward(widened).view(S, Hkv, hd)
-        v = self.v_proj.forward(widened).view(S, Hkv, hd)
-        # RoPE on k uses the shared rotary, which rotates q (H heads) and k (Hkv heads) jointly; compute
-        # q only to satisfy the call and discard it (the seed needs k/v, not q).
-        q = self.q_proj.forward(widened).view(S, H, hd)
-        _, k_flat = self.rotary.forward(
-            positions, q.reshape(S, H * hd).contiguous(), k.reshape(S, Hkv * hd).contiguous()
-        )
-        k = k_flat.view(S, Hkv, hd)
-        return [(k[s : s + 1], v[s : s + 1]) for s in range(S)]
 
 
 __all__ = ["GLMEagle3DraftModel"]
