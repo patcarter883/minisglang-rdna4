@@ -34,8 +34,9 @@ THE RULES THE BODY MUST OBEY (each one is a real failure this repo has hit)
  3. No Python control flow that varies per step. Fixed trip counts only.
  4. Index tensors are PERSISTENT and refreshed IN PLACE — a graph records kernel argument POINTERS.
  5. Allocation inside the body is charged to the graph's private pool permanently, per graph. Keep
-    transients small (this is why every drafter here uses a GROUPED-query einsum instead of
-    ``repeat_interleave`` — the expanded K/V is rep x larger and it OOM'd the pool).
+    transients small (this is why no drafter here materialises a ``repeat_interleave``'d K/V — the
+    expanded K/V is rep x larger and it OOM'd the pool; the DFlash/DSpark drafter goes further and
+    reads its prefix ring IN PLACE through the HIP paged-attention kernel, no gather, no concat).
  6. ``torch.inference_mode()`` around BOTH warmup and capture (grad-active in-place-on-view ops trip
     the autograd view guard and break capture).
  7. Warm up on a side stream (twice) before capture, then capture with a SHARED pool.

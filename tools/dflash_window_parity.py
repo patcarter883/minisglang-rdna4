@@ -1,25 +1,33 @@
-"""Parity gate for the DFlash O(window) propose rewrite (deliverable 1, edits a/b/g).
+"""Parity gate for the DFlash drafter's O(window) eager propose (`denoise_cached`).
 
 WHAT IS BEING CLAIMED, and what is NOT.
 
-Edits (a) window-slice-the-prefix, (b) grouped-GQA einsum and (g) single-rope remove work that the
-drafter's OWN causal + sliding-window mask already discards, or that was computed twice. The claim is
-therefore that the DRAFTED TOKEN IDS are identical, not that the logits are bitwise equal:
+The eager propose (a) window-slices the prefix to the rows the drafter's causal + sliding-window mask
+can reach, and (b) runs the block attention on the HIP paged flash kernel
+(attn_prefill_paged.flash_prefill_paged, models/dflash.py `drafter_attend`), not in torch.
 
-  * removed keys contribute exp(-inf - max) == 0.0 EXACTLY and 0.0 * V == 0.0, so their contribution
-    to the value is exactly zero in exact arithmetic;
-  * but softmax and the probs·V einsum both reduce over `s`, whose LENGTH changes (P+B -> W+B). torch
-    / rocBLAS partition a reduction differently at different lengths, so the surviving nonzero terms
-    are GROUPED differently and the last bits may move. `torch.equal` failing is not a bug.
+  * (a) is EXACT in exact arithmetic: every dropped row is -inf for every query, so it contributes
+    exp(-inf - max) == 0.0. That is checked STRUCTURALLY below (asserts), not numerically.
+  * (b) is NOT bit-identical to the torch einsum/softmax it replaced, and is not required to be. A
+    drafted token only changes ACCEPTANCE — the target verifies every draft, so a drafter's numerics
+    are a speed question, never a correctness one. (The previous version of this file required
+    drafted-token identity with the torch path and used a ~1-ULP argmax flip to justify keeping torch
+    attention; that requirement is withdrawn.)
 
-So this harness gates on: (1) argmax equality of every drafted position, (2) max|Δlogit| at bf16
-epsilon scale, at several prefix lengths spanning P < W, P == W and P >> W. It compares the SHIPPED
-`DFlashDraftModel.denoise_cached` against a reference that reimplements the pre-change body verbatim
-(full prefix, `repeat_interleave` GQA, double rope).
+THE CONTRACT this gate enforces: the shipped path is numerically CLOSE to an fp32-attention
+reference — the pre-change full-prefix `repeat_interleave` formulation with q/K/V upcast to fp32 —
+and no further from it than the bf16 torch path it replaced:
+  (1) max|delta logit| (shipped vs fp32 ref) <= the torch-bf16 path's own max|delta logit| x 1.5,
+  (2) drafted-token argmax agreement with the fp32 ref >= the torch-bf16 path's agreement - 1%.
+Both are REPORTED per prefix length spanning P < W, P == W and P >> W. Random weights (near-uniform
+logits, tiny top-1 margins) make this an adversarial stand-in for a trained drafter; the real-weight
+numbers are in tools/dflash_drafter_attn_bench.py.
 
 Run inside the serve image on one leased card:
-  gpu-lease -n 1 -- docker compose --profile run run --rm \
-      -e MINISGL_CMD="python /engine/tools/dflash_window_parity.py" run
+  gpu-lease -n 1 -- docker run --rm <ROCm device flags> -e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES \
+      -e ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES -v <worktree>:/engine \
+      -e PYTHONPATH=/engine/python:/opt/kernels minisgl-rdna4:<tag> \
+      python /engine/tools/dflash_window_parity.py
 """
 from __future__ import annotations
 
@@ -49,9 +57,10 @@ EPS = 1e-6
 ROPE_THETA = 500000.0
 
 
-def _ref_attend_block(layer, hidden, block_pos, k_ctx, v_ctx, attn_mask, grouped=False):
-    """The PRE-CHANGE `_DFlashLayer.attend_block` body, verbatim: full prefix, repeat_interleave GQA.
-    `grouped=True` swaps ONLY the GQA einsum for the new one, to isolate edit (b) from edit (a)."""
+def _ref_attend_block(layer, hidden, block_pos, k_ctx, v_ctx, attn_mask, fp32=False):
+    """The PRE-CHANGE `_DFlashLayer.attend_block` body: full prefix, `repeat_interleave` GQA, torch
+    einsum/softmax. `fp32=True` upcasts q/K/V for the attention only — the REFERENCE both the shipped
+    HIP path and the old bf16 torch path are scored against."""
     B = hidden.shape[0]
     H, Hkv, hd = layer.num_heads, layer.num_kv_heads, layer.head_dim
     residual = hidden
@@ -69,21 +78,16 @@ def _ref_attend_block(layer, hidden, block_pos, k_ctx, v_ctx, attn_mask, grouped
     K = torch.cat([k_ctx, k_noise], dim=0)
     V = torch.cat([v_ctx, v_noise], dim=0)
     group = H // Hkv
-    if grouped:
-        q4 = q.view(B, Hkv, group, hd)
-        scores = torch.einsum("bkgd,skd->bkgs", q4, K) * layer.scale
-        if attn_mask is not None:
-            scores = scores + attn_mask[:, None, None, :]
-        probs = scores.softmax(dim=-1).to(V.dtype)
-        attn = torch.einsum("bkgs,skd->bkgd", probs, V).reshape(B, H, hd)
-    else:
-        K = K.repeat_interleave(group, dim=1)
-        V = V.repeat_interleave(group, dim=1)
-        scores = torch.einsum("bhd,shd->bhs", q, K) * layer.scale
-        if attn_mask is not None:
-            scores = scores + attn_mask.unsqueeze(1)
-        probs = scores.softmax(dim=-1).to(V.dtype)
-        attn = torch.einsum("bhs,shd->bhd", probs, V)
+    K = K.repeat_interleave(group, dim=1)
+    V = V.repeat_interleave(group, dim=1)
+    dt = V.dtype
+    if fp32:
+        q, K, V = q.float(), K.float(), V.float()
+    scores = torch.einsum("bhd,shd->bhs", q, K) * layer.scale
+    if attn_mask is not None:
+        scores = scores + attn_mask.unsqueeze(1)
+    probs = scores.softmax(dim=-1).to(V.dtype)
+    attn = torch.einsum("bhs,shd->bhd", probs, V).to(dt)
     if layer.gated:
         gate = torch.nn.functional.softplus(layer.g_proj.forward(x).float()).to(attn.dtype)
         attn = attn * gate.unsqueeze(-1)
@@ -108,19 +112,13 @@ def _ref_project_ctx(layer, target_hidden, ctx_pos):
 
 
 @torch.inference_mode()
-def _ref_denoise_cached(model, noise_embed, prefix_kv, block_pos, *, slice_win=False, grouped=False):
-    """The PRE-CHANGE `denoise_cached`. `slice_win` turns on edit (a) only, `grouped` edit (b) only —
-    so the four legs (neither / a / b / both) isolate which change moves the bits."""
+def _ref_denoise_cached(model, noise_embed, prefix_kv, block_pos, *, fp32=False):
+    """The PRE-CHANGE `denoise_cached` over the FULL (unsliced) prefix, torch attention."""
     hidden = noise_embed
     P = prefix_kv[0][0].shape[0]
-    if slice_win:
-        p = model.window_prefix(P)
-        if p < P:
-            prefix_kv = [(k[P - p :], v[P - p :]) for (k, v) in prefix_kv]
-            P = p
-    mask = model._block_mask(P, noise_embed.shape[0], noise_embed.device)
-    for layer, (k_ctx, v_ctx) in zip(model.layers, prefix_kv):
-        hidden = _ref_attend_block(layer, hidden, block_pos, k_ctx, v_ctx, mask, grouped=grouped)
+    masks = model.layer_masks(P, noise_embed.shape[0], noise_embed.device)
+    for layer, (k_ctx, v_ctx), mask in zip(model.layers, prefix_kv, masks):
+        hidden = _ref_attend_block(layer, hidden, block_pos, k_ctx, v_ctx, mask, fp32=fp32)
     return model.norm.forward(hidden)
 
 
@@ -151,7 +149,7 @@ def _randomize(model, dtype, device, gen):
 
 
 @torch.inference_mode()
-def main(seed: int = 20260801) -> int:
+def main(seed: int = 20260801):
     device = torch.device("cuda")
     dtype = torch.bfloat16
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -170,18 +168,15 @@ def main(seed: int = 20260801) -> int:
     finally:
         torch.set_default_dtype(prev)
     _randomize(model, dtype, device, gen)
-    # Stand-in for the borrowed target lm_head: a fixed random [vocab, hidden]. The real head is
-    # M-invariant by construction (layers/embedding.py) and identical on both legs, so ANY fixed
-    # linear map exercises the same argmax question with far less memory.
+    # Stand-in for the borrowed target lm_head: a fixed random [vocab, hidden]. Identical on every
+    # leg, so ANY fixed linear map exercises the same argmax question with far less memory.
     vocab = 8192
     head_w = (torch.randn((vocab, HIDDEN), generator=gen, device=device, dtype=torch.float32)
               * HIDDEN ** -0.5).to(dtype)
 
-    ok = True
-    flips = [0, 0]
-    print(f"{'P':>7} {'rows':>5} {'|logit|':>9} "
-          f"{'(a)dmax':>10} {'(a)flip':>8} {'(b)dmax':>10} {'(b)flip':>8} "
-          f"{'(ab)dmax':>10} {'(ab)flip':>9} {'ref_ms':>8} {'new_ms':>8}")
+    tally = dict(new=0, old=0, n=0, dnew=0.0, dold=0.0)
+    print(f"{'P':>7} {'rows':>5} {'|logit|':>9} {'new dmax':>10} {'new agree':>10} "
+          f"{'old dmax':>10} {'old agree':>10}")
     for P in (64, 256, 511, 512, 513, 1024, 4096, 16384):
         base = 100000  # absolute position of the block; prefix occupies [base-P, base-1]
         aux = (torch.randn((P, NUM_AUX, HIDDEN), generator=gen, device=device,
@@ -195,80 +190,59 @@ def main(seed: int = 20260801) -> int:
         target_hidden = model.fuse_aux(aux)
         prefix_ref = [_ref_project_ctx(l, target_hidden, ctx_pos) for l in model.layers]
         prefix_new = [l.project_ctx(target_hidden, ctx_pos) for l in model.layers]
-        # (g) single-rope must be BIT-identical (same kernel, same input).
-        rope_bit_eq = all(torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
-                          for a, b in zip(prefix_ref, prefix_new))
-        if not rope_bit_eq:
-            print(f"  FAIL: project_ctx single-rope is not bit-identical at P={P}")
-            ok = False
+        # single-rope project_ctx must be BIT-identical (same kernel, same input).
+        assert all(torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+                   for a, b in zip(prefix_ref, prefix_new)), (
+            f"project_ctx single-rope is not bit-identical at P={P}")
 
         def _logits(h):
             return (h.float() @ head_w.float().T)[1:]
 
-        lg_ref = _logits(_ref_denoise_cached(model, noise, prefix_ref, block_pos))
-        lg_a = _logits(_ref_denoise_cached(model, noise, prefix_ref, block_pos, slice_win=True))
-        lg_b = _logits(_ref_denoise_cached(model, noise, prefix_ref, block_pos, grouped=True))
+        lg_ref = _logits(_ref_denoise_cached(model, noise, prefix_ref, block_pos, fp32=True))
+        lg_old = _logits(_ref_denoise_cached(model, noise, prefix_ref, block_pos))
         lg_new = _logits(model.denoise_cached(noise, prefix_new, block_pos))
         ref_am = lg_ref.argmax(-1)
 
         def _cmp(lg):
-            am = lg.argmax(-1)
-            return ((lg_ref - lg).abs().max().item(), int((am != ref_am).sum()))
+            return ((lg_ref - lg).abs().max().item(), int((lg.argmax(-1) == ref_am).sum()))
 
-        (da, ea), (db, eb), (dn, en) = _cmp(lg_a), _cmp(lg_b), _cmp(lg_new)
+        (dn, an), (do, ao) = _cmp(lg_new), _cmp(lg_old)
         rows_new = model.window_prefix(P)
-        scale = lg_ref.abs().max().item()
+        nk = lg_ref.shape[0]
 
-        # STRUCTURAL check (the one that is exact, and the one that actually matters): every prefix
-        # row the window slice drops must be -inf for EVERY query in the block, i.e. it contributes
-        # exp(-inf - max) == 0.0 exactly. If this holds, the slice removes only exact zeros and any
-        # residual delta is reduction reassociation, not lost information.
-        full_mask = model._block_mask(P, BLOCK, device)
+        # STRUCTURAL check (exact): every prefix row the window slice drops is -inf for EVERY query
+        # in the block, and the surviving mask equals the mask the sliced call builds (no
+        # position-base shift). Laguna is uniform (every layer causal @ WINDOW).
+        full_mask = model._block_mask(P, BLOCK, device, True, WINDOW)
         dropped = P - rows_new
         if dropped > 0:
             assert bool(torch.isinf(full_mask[:, :dropped]).all()), (
-                f"P={P}: window slice would drop a LIVE key -- edit (a) is wrong")
-        # ...and the surviving mask must equal the mask the sliced call builds (no position-base shift).
-        sliced_mask = model._block_mask(rows_new, BLOCK, device)
+                f"P={P}: window slice would drop a LIVE key")
+        sliced_mask = model._block_mask(rows_new, BLOCK, device, True, WINDOW)
         assert torch.equal(full_mask[:, dropped:], sliced_mask), (
             f"P={P}: sliced mask != full mask tail -- the position base IS shifted")
 
-        def _bench(fn, iters=5):
-            fn(); torch.cuda.synchronize()
-            best = float("inf")
-            for _ in range(iters):  # MIN-of-N, never a mean
-                torch.cuda.synchronize(); t = torch.cuda.Event(True); e = torch.cuda.Event(True)
-                t.record(); fn(); e.record(); torch.cuda.synchronize()
-                best = min(best, t.elapsed_time(e))
-            return best
-
-        ms_ref = _bench(lambda: _ref_denoise_cached(model, noise, prefix_ref, block_pos))
-        ms_new = _bench(lambda: model.denoise_cached(noise, prefix_new, block_pos))
-        nk = lg_ref.shape[0]
-        print(f"{P:>7} {rows_new:>5} {scale:>9.2f} "
-              f"{da:>10.3e} {str(ea)+'/'+str(nk):>8} {db:>10.3e} {str(eb)+'/'+str(nk):>8} "
-              f"{dn:>10.3e} {str(en)+'/'+str(nk):>9} {ms_ref:>8.3f} {ms_new:>8.3f}")
-        flips[0] += en; flips[1] += nk
-        ok = ok and (en == 0)
-
-    print(f"seed={seed} drafted-id flips: {flips[0]}/{flips[1]}  "
-          + ("ALL-IDENTICAL" if ok else "SOME DIFFER"))
-    return flips[0], flips[1]
+        print(f"{P:>7} {rows_new:>5} {lg_ref.abs().max().item():>9.2f} "
+              f"{dn:>10.3e} {str(an) + '/' + str(nk):>10} {do:>10.3e} {str(ao) + '/' + str(nk):>10}")
+        tally["new"] += an; tally["old"] += ao; tally["n"] += nk
+        tally["dnew"] = max(tally["dnew"], dn); tally["dold"] = max(tally["dold"], do)
+    return tally
 
 
 if __name__ == "__main__":
-    # EXIT CODE IS THE STRUCTURAL GATE, not the flip count. The asserts inside main() are the actual
-    # correctness statement -- every prefix row the window slice drops is provably -inf for every
-    # query, and the sliced mask equals the full mask's tail (no position-base shift). Those either
-    # hold or the run dies. The flip count is DATA about floating-point reassociation, reported so it
-    # cannot be quietly rounded away: with RANDOM weights (near-uniform logits, tiny top-1 margins --
-    # a deliberately adversarial stand-in for a trained drafter) roughly 1 drafted position in 600
-    # moves. On the real Laguna drafter in a real serve it is 1 in 3810 (tools/dflash_owindow_ab.sh).
-    tot_f = tot_n = 0
+    # EXIT CODE = the structural asserts in main() (hard) + the closeness contract (see docstring).
+    tot = dict(new=0, old=0, n=0, dnew=0.0, dold=0.0)
     for s in (20260801, 11, 12345, 987654321, 424242):
-        f, n = main(s)
-        tot_f += f; tot_n += n
-    print(f"STRUCTURAL GATE: PASS (all masked-row / mask-tail asserts held)")
-    print(f"REASSOCIATION: {tot_f}/{tot_n} drafted positions differ "
-          f"({100.0 * tot_f / max(1, tot_n):.2f}%) -- see the module docstring for why this is not 0")
-    raise SystemExit(0)
+        t = main(s)
+        for k in ("new", "old", "n"):
+            tot[k] += t[k]
+        tot["dnew"] = max(tot["dnew"], t["dnew"]); tot["dold"] = max(tot["dold"], t["dold"])
+    n = max(1, tot["n"])
+    a_new, a_old = tot["new"] / n, tot["old"] / n
+    ok_d = tot["dnew"] <= 1.5 * tot["dold"]
+    ok_a = a_new >= a_old - 0.01
+    print("STRUCTURAL GATE: PASS (all masked-row / mask-tail / single-rope asserts held)")
+    print(f"CLOSENESS vs fp32-attention reference: shipped HIP max|dlogit| {tot['dnew']:.3e} "
+          f"(torch-bf16 {tot['dold']:.3e}) -> {'PASS' if ok_d else 'FAIL'}; drafted-token agreement "
+          f"shipped {100 * a_new:.2f}% vs torch-bf16 {100 * a_old:.2f}% -> {'PASS' if ok_a else 'FAIL'}")
+    raise SystemExit(0 if (ok_d and ok_a) else 1)
