@@ -2280,7 +2280,8 @@ class Engine:
             return self.model.forward(return_hidden=return_hidden)
 
     def forward_canvas(
-        self, batch: Batch, canvas_ids: torch.Tensor, self_conditioning: torch.Tensor
+        self, batch: Batch, canvas_ids: torch.Tensor, self_conditioning: torch.Tensor,
+        softcap: bool = True
     ) -> torch.Tensor:
         """One block-diffusion denoising step. Returns full-vocab fp32 logits for EVERY canvas
         position, ``[sum(extend_len), vocab]``.
@@ -2319,7 +2320,7 @@ class Engine:
             self.attn_backend.prepare_metadata(batch)
             with self.ctx.forward_batch(batch):
                 hidden = self.model.forward_canvas_hidden(canvas_ids, self_conditioning)
-        return self.model.canvas_logits(hidden)
+        return self.model.canvas_logits(hidden, softcap=softcap)
 
     def _capture_canvas_graphs(self, config: EngineConfig) -> None:
         """Capture the block-diffusion canvas graphs, at boot, for every batch size the serve can
