@@ -280,7 +280,31 @@ def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     # generic PretrainedConfig fallback (unknown architectures like ZAYA's "zaya"). Restore it so
     # model_type-gated logic (e.g. ModelConfig.is_cca) sees the real type.
     fresh.model_type = config.model_type
+    _allow_global_per_layer_reads(fresh)
     return fresh
+
+
+def _allow_global_per_layer_reads(config: PretrainedConfig) -> None:
+    """Opt the loaded config (and every nested sub-config) into reading per-layer attributes at
+    their GLOBAL value.
+
+    transformers 5.17 marks attributes that a checkpoint overrides per layer (Gemma-4 /
+    DiffusionGemma: `head_dim` 256 -> 512 and `num_key_value_heads` 8 -> 2 on the five full-attention
+    layers) and RAISES on a global read, which killed ModelConfig.from_hf before any weight loaded.
+    The global value is the config.json top-level number, i.e. exactly what every earlier
+    transformers returned. The per-layer geometry is read separately by ModelConfig.from_hf
+    (`_full_layer_override`), because 5.17 also DROPS `global_head_dim` /
+    `num_global_key_value_heads` in favour of these overrides."""
+    seen: set[int] = set()
+    stack = [config]
+    while stack:
+        cfg = stack.pop()
+        if id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        if cfg.__dict__.get("_heterogeneity_spec") is not None:
+            cfg.allow_global_per_layer_attribute_access = True
+        stack.extend(v for v in cfg.__dict__.values() if isinstance(v, PretrainedConfig))
 
 
 def download_hf_weight(model_path: str) -> str:
