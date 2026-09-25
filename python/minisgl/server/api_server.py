@@ -3906,9 +3906,11 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         # The engine refused this request (e.g. prompt longer than the KV pool). Answer with a real
         # 4xx: returning an empty 200 would look like the model chose to say nothing, and the old
         # behaviour — no reply at all — hung the caller until its own timeout.
+        # The tokenizer worker's image rejections share this channel; they are not a length error.
+        _img = rejected.startswith("invalid image input")
         return JSONResponse(status_code=400, content={"error": {
             "message": rejected, "type": "invalid_request_error", "param": "messages",
-            "code": "context_length_exceeded"}})
+            "code": "invalid_image" if _img else "context_length_exceeded"}})
     full_content = "".join(content_chunks)
 
     # Tool calls are extracted from the RAW output FIRST, BEFORE the reasoning split. A reasoning

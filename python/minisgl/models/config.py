@@ -116,9 +116,11 @@ _KNOWN_LAYER_TYPES = _FULL_CONTEXT_ATTENTION | {"linear_attention", "sliding_att
 
 def _vision_fields(top) -> Optional[Dict]:
     """The vision tower's geometry and the image special tokens, or None without a tower."""
-    vc = getattr(top, "vision_config", None)
-    if vc is None or getattr(top, "image_token_id", None) is None:
+    from minisgl.tokenizer.vision import vision_tower_type
+
+    if vision_tower_type(top) is None:  # no tower, or one this engine does not implement
         return None
+    vc = top.vision_config
     d = vc.to_dict() if hasattr(vc, "to_dict") else dict(vc)
     return {
         "hidden_size": int(d["hidden_size"]),

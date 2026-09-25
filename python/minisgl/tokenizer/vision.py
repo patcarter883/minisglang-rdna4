@@ -31,14 +31,26 @@ IMAGE_SENTINEL = "<|minisgl_image|>"
 
 _PAD_SPAN = 1 << 30  # pad ids are vocab_size + hash % 2^30: above the vocab, inside int32
 
+# Vision towers this engine implements, by the checkpoint's `vision_config.model_type`. A checkpoint
+# can carry a `vision_config` for a tower we do not have (Qwen3.5/3.6 do); it is text-only here.
+SUPPORTED_VISION_TOWERS = ("gemma4_vision",)
+
+
+def vision_tower_type(cfg) -> str | None:
+    """The checkpoint's vision tower type when this engine implements it, else None."""
+    vc = getattr(cfg, "vision_config", None)
+    if vc is None or getattr(cfg, "image_token_id", None) is None:
+        return None
+    mt = getattr(vc, "model_type", None) if not isinstance(vc, dict) else vc.get("model_type")
+    return mt if mt in SUPPORTED_VISION_TOWERS else None
+
 
 class VisionPreprocessor:
     def __init__(self, model_path: str, tokenizer) -> None:
         from minisgl.utils.hf import cached_load_hf_config
 
         cfg = cached_load_hf_config(model_path)
-        self.supported = getattr(cfg, "vision_config", None) is not None and \
-            getattr(cfg, "image_token_id", None) is not None
+        self.supported = vision_tower_type(cfg) is not None
         if not self.supported:
             return
         text_cfg = getattr(cfg, "text_config", cfg)
