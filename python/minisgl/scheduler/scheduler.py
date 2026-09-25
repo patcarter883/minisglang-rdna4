@@ -4563,8 +4563,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         presence/frequency subtraction to the verify block that `Sampler.sample` applies on the plain
         lane, per position, against the history plus that row's draft prefix. They used to be refused
         the lane because the accept paths read raw logits and the penalty would have been inert —
-        a guard around a missing processor, which is now present."""
+        a guard around a missing processor, which is now present.
+        Reqs that asked for per-token LOGPROBS do not speculate: only the plain lane's Sampler captures
+        them, so a spec-decoded req returned one entry (its prefill token) for N generated tokens — a
+        200 with silently truncated logprobs. Their batch takes the plain lane while they decode."""
         sp = req.sampling_params
+        if getattr(sp, "logprobs", 0):
+            return False
         return sp.is_greedy or self._spec_sampled
 
     def _fused_route_ok(self, reqs: List[Req]) -> bool:
