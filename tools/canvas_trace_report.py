@@ -16,7 +16,11 @@ GAP vs BUSY. Summing kernel durations double-counts nothing but also ignores ove
 report gives both: `busy` = sum of dispatch durations, `wall` = the marker range span. busy/wall is
 the occupancy of the step by SOME kernel, and a low ratio is the host/gap story.
 
-  python3 tools/canvas_trace_report.py <trace_dir> [--top N]
+  python3 tools/canvas_trace_report.py <trace_dir> [--top N] [--steps PREFIX[,PREFIX]]
+
+--steps picks which ROCTx ranges delimit a STEP (default `canvas_step#`). A plain autoregressive
+decode serve marks its loop iterations `normal_step#N` / `overlap_step#N` (scheduler._rtx_step_begin),
+so `--steps normal_step#,overlap_step#` gives the same per-step decomposition for SPEC=none decode.
 """
 from __future__ import annotations
 
@@ -109,6 +113,8 @@ def main() -> int:
         return 2
     d = sys.argv[1]
     topn = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 18
+    step_prefixes = tuple((sys.argv[sys.argv.index("--steps") + 1] if "--steps" in sys.argv
+                           else "canvas_step#").split(","))
 
     kf = _find(d, "kernel_trace.csv")
     mf = _find(d, "marker_api_trace.csv", "marker_trace.csv")
@@ -132,7 +138,7 @@ def main() -> int:
             e = _num(r, "End_Timestamp", "End_Timestamp(ns)")
             if e <= s:
                 continue
-            if nm.startswith("canvas_step#"):
+            if nm.startswith(step_prefixes):
                 steps.append((s, e, nm))
             elif nm.startswith("canvas_"):
                 ranges.append((s, e, nm))
@@ -160,11 +166,11 @@ def main() -> int:
     nsteps = len(steps)
     if nsteps:
         wall = sum(e - s for s, e, _ in steps)
-        print(f"\ncanvas steps in the window : {nsteps}"
+        print(f"\nsteps ({','.join(step_prefixes)}) in the window : {nsteps}"
               f"   (marker wall {wall/1e6:.2f} ms total, {wall/nsteps/1e6:.2f} ms/step)")
         lo, hi = steps[0][0], steps[-1][1]
     else:
-        print("\n!! no canvas_step# markers — the collection window never opened over the canvas loop")
+        print(f"\n!! no {','.join(step_prefixes)} markers — the collection window never opened over the loop")
         lo, hi = 0, 1 << 62
 
     # ---- kernels -------------------------------------------------------------------------------
