@@ -109,6 +109,23 @@ class Gemma4VisionTower(BaseOP):
     def forward(self, *args, **kwargs):
         raise NotImplementedError("use encode()")
 
+    def warmup(self) -> None:
+        """Encode a synthetic image at the full soft-token budget (45x54 patches = 270 soft tokens)
+        plus a small one, touching every kernel the tower launches at the tile shapes a real image
+        selects. Called once at engine boot."""
+        dev = self.patch_proj.device
+        # A PRIVATE generator, never the default one: the default generator's Philox offset advances
+        # per random kernel by an amount set by the launch grid, i.e. by the card's CU count, so a
+        # draw this size moves it differently on the 64-CU and the 56-CU card and leaves the TP
+        # ranks' sampling streams permanently out of step.
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(0)
+        for pw, ph in ((45, 54), (9, 9)):
+            px = torch.randint(0, 256, (pw * ph, self.patch_proj.shape[1]), dtype=torch.uint8,
+                               device=dev, generator=gen)
+            self.encode([(px, pw, ph)])
+        torch.cuda.synchronize(dev)
+
     @torch.inference_mode()
     def encode(self, images: Sequence[Tuple[torch.Tensor, int, int]]) -> List[torch.Tensor]:
         """[(uint8 patches [pw*ph, 768] on device, pw, ph)] -> per image [(pw/k)*(ph/k), text_hidden]."""

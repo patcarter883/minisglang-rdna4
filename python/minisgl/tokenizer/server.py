@@ -79,6 +79,10 @@ def tokenize_worker(
     from .tokenize import TokenizeManager
 
     tokenize_manager = TokenizeManager(tokenizer, tokenizer_path)
+    try:
+        tokenize_manager.warm_vision()
+    except Exception as e:  # noqa: BLE001 — a vision warm-up failure must not stop a text serve
+        logger.warning(f"image preprocessor warm-up failed ({e}); image requests will retry it")
     detokenize_manager = DetokenizeManager(
         tokenizer, resolve_stop_token_ids(tokenizer_path, tokenizer)
     )

@@ -375,6 +375,12 @@ class Engine:
                 with _bt.phase("oneshot_post_load"):
                     self.model.post_load()  # finalize weights (quantized layout conversion)
         _mem_probe("after post_load")
+        # Vision tower: one full-budget encode at boot, so the first image request does not pay for
+        # the tower's first kernel launches; its transients are released before KV sizing.
+        if getattr(self.model, "vision", None) is not None:
+            with _bt.phase("vision_warmup"):
+                self.model.vision.warmup()
+            torch.cuda.empty_cache()
         # THE ONE DECISION post_load MAKES THAT NO TENSOR RECORDS, checked across the ranks that made
         # it independently. A compressed-tensors int4 container decides its packed sign convention
         # from a SAMPLE of its own shard, and no two TP ranks hold the same bytes (plain TP splits

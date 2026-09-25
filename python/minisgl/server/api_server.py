@@ -3509,6 +3509,12 @@ async def lifespan(_: FastAPI):
         get_global_state()._create_listener_once()
     except Exception:  # noqa: BLE001 - never block startup on the metrics link
         logger.warning("could not start the scheduler listener at startup", exc_info=True)
+    # Load the frontend tokenizer and derive the reasoning delimiters BEFORE accepting connections:
+    # both are lazy and cost ~8 s on a 262k-vocab tokenizer, which the first request used to pay.
+    try:
+        await asyncio.to_thread(_reasoning_parser)
+    except Exception:  # noqa: BLE001 - resolved again (and logged) on the first request
+        logger.warning("could not resolve the reasoning parser at startup", exc_info=True)
     yield
     # shutdown code here
     global _GLOBAL_STATE

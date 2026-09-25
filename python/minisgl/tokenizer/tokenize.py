@@ -20,6 +20,21 @@ class TokenizeManager:
         # Per-message side channel of the last tokenize() call: (mm_images | None, error | None).
         self.last_mm: List = []
 
+    def warm_vision(self) -> None:
+        """Build the image preprocessor now (transformers image-processing + torchvision imports and
+        the processor config) and run it once on a tiny image, instead of on the first image request.
+        A text-only checkpoint only pays the config read."""
+        vp = self._vision_pre()
+        if vp.supported:
+            import io
+
+            import numpy as np
+            from PIL import Image
+
+            buf = io.BytesIO()
+            Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)).save(buf, "PNG")
+            vp.process_image(buf.getvalue())
+
     def _vision_pre(self):
         if self._vision is None:
             from .vision import VisionPreprocessor
