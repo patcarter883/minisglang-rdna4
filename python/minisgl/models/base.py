@@ -31,6 +31,11 @@ class BaseLLMModel(ABC, BaseOP):
 
     # decoder-layer ids whose output hidden is captured during forward (None/empty = no aux capture).
     _capture_layer_ids: Optional[List[int]] = None
+    # True for a model whose forward() already applies the config's final-logit softcap to the logits
+    # it returns (as the reference does, in *ForCausalLM.forward). The engine then gives the sampler
+    # NO cap: a second cap computes 30*tanh(tanh(l/30)), which on Gemma-4 (capped logits ~20-25)
+    # scales every logit gap by ~0.6 — sampling at ~1.6x the requested temperature.
+    applies_logit_softcap: bool = False
 
     def set_capture_layers(self, ids: Optional[List[int]]) -> None:
         """Program which decoder layers stash their output hidden during the next forward.

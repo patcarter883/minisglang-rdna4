@@ -17,6 +17,9 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    # Image state (minisgl.multimodal.ReqVision) for a request with images; None otherwise. Shared by
+    # every chunk's Req, so an image is encoded once however the prompt is chunked.
+    mm: object | None = None
 
     @property
     def input_len(self) -> int:

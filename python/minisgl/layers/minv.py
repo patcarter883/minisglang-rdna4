@@ -354,7 +354,9 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
     if OUT % bn != 0:
         # ragged OUT: only the LDS kernel masks a partial N-tile (a direct fragment load cannot).
         # Checked against the tile actually chosen, not a module constant — that is the whole point.
-        out = _dg.dense_gemm(x2, weight, bm, bn)
+        # The LDS kernel's block_m ceiling is 128 while the pipe rule above goes to 256 at M>=512, so a
+        # ragged-OUT linear at a long prefill used to be REFUSED outright ("block_m ... <= 128").
+        out = _dg.dense_gemm(x2, weight, min(bm, 128), bn)
     elif OUT <= _SPLITK_MAX_OUT and IN >= _SPLITK_MIN_IN:
         # Split-K reduction order — committed by SHAPE (see the note at the top of this file), so
         # every M on this weight reduces identically. Only the SCHEDULE below reads M, and it may,

@@ -239,6 +239,8 @@ class MuseGlimmerForConditionalGeneration(BaseLLMModel):
     """Muse-Glimmer 30B. The `ForConditionalGeneration` name is the checkpoint's (it is a vision
     model); this serves the text decoder only."""
 
+    applies_logit_softcap = True  # forward() caps; the sampler must not cap again
+
     def __init__(self, config: "ModelConfig"):
         self.model = MuseGlimmerModel(config)
         self.lm_head = ParallelLMHead(

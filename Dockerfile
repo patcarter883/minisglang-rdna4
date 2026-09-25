@@ -62,7 +62,17 @@ RUN pip install \
         "transformers>=4.56" tokenizers safetensors "huggingface-hub" accelerate modelscope \
         sentencepiece einops \
         numpy msgpack pyzmq psutil xgrammar \
-        fastapi uvicorn pydantic starlette prompt_toolkit openai
+        fastapi uvicorn pydantic starlette prompt_toolkit openai pillow
+
+# --- image inputs (vision-capable checkpoints, e.g. Gemma-4): the checkpoint's own image processor is
+# torchvision-backed in transformers 5.x, and the tokenizer worker runs it to get the reference's exact
+# resize. torchvision is pinned to the SAME nightly date as the torch installed above (a mismatched
+# nightly pair can fail to import its C ops), and --no-deps keeps pip from touching torch.
+RUN D=$(python -c "import re, torch; print(re.search(r'dev(\d{8})', torch.__version__).group(1))") \
+ && V=$(pip index versions torchvision --pre --index-url ${TORCH_INDEX} 2>/dev/null \
+        | tr ',' '\n' | grep -o "[0-9.]*dev${D}+[a-z0-9.]*" | head -1) \
+ && test -n "$V" && pip install --pre --no-deps "torchvision==${V}" --index-url ${TORCH_INDEX} \
+ && python -c "import torch, torchvision; print('torchvision', torchvision.__version__, 'torch', torch.__version__)"
 
 # --- build the custom HIP kernels from the CANONICAL repo (source of truth) ------------------------
 # Each subdir of rdna4-hip-kernels is an independent kernel-builder package with a no-Nix local

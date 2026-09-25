@@ -13,8 +13,34 @@ _logger = logging.getLogger("minisgl.tokenize")
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, model_path: str | None = None) -> None:
         self.tokenizer = tokenizer
+        self._model_path = model_path
+        self._vision = None  # built on the first request that carries images
+        # Per-message side channel of the last tokenize() call: (mm_images | None, error | None).
+        self.last_mm: List = []
+
+    def warm_vision(self) -> None:
+        """Build the image preprocessor now (transformers image-processing + torchvision imports and
+        the processor config) and run it once on a tiny image, instead of on the first image request.
+        A text-only checkpoint only pays the config read."""
+        vp = self._vision_pre()
+        if vp.supported:
+            import io
+
+            import numpy as np
+            from PIL import Image
+
+            buf = io.BytesIO()
+            Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)).save(buf, "PNG")
+            vp.process_image(buf.getvalue())
+
+    def _vision_pre(self):
+        if self._vision is None:
+            from .vision import VisionPreprocessor
+
+            self._vision = VisionPreprocessor(self._model_path, self.tokenizer)
+        return self._vision
 
     def _render_chat(self, msg) -> str:
         """Render a chat-messages list through the model's template. A malformed message list (e.g. a
@@ -73,6 +99,16 @@ class TokenizeManager:
             else:
                 prompt = msg.text
                 templated.append(False)
+            if getattr(msg, "images", None):
+                vp = self._vision_pre()
+                if vp.supported:
+                    prompt = vp.render(prompt)
+            else:
+                from .vision import IMAGE_SENTINEL
+
+                # An endpoint that does not forward images still flattens image parts to the
+                # sentinel; with no image to fill it, it must not reach the model as literal text.
+                prompt = prompt.replace(IMAGE_SENTINEL, "")
             prompts.append(prompt)
         if not prompts:
             return []
@@ -93,4 +129,21 @@ class TokenizeManager:
                 self.tokenizer(p, add_special_tokens=not t)["input_ids"]
                 for p, t in zip(prompts, templated)
             ]
+        # Images: expand each placeholder into <boi> + soft-token pads + <eoi> and preprocess the pixels.
+        # Per message, so one bad image fails ITS request (reported via last_mm) and not the batch.
+        self.last_mm = []
+        for i, msg in enumerate(msgs):
+            images = getattr(msg, "images", None)
+            if not images:
+                self.last_mm.append((None, None))
+                continue
+            try:
+                vp = self._vision_pre()
+                if not vp.supported:
+                    raise ValueError("this model does not accept image inputs")
+                encoded[i], items = vp.expand(list(encoded[i]), images)
+                self.last_mm.append((items, None))
+            except Exception as e:  # noqa: BLE001 — a bad image must fail its request, not the worker
+                _logger.warning("image request %s rejected: %s", msg.uid, e)
+                self.last_mm.append((None, f"invalid image input: {e}"))
         return [torch.tensor(ids, dtype=torch.int32) for ids in encoded]

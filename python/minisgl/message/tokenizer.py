@@ -64,6 +64,10 @@ class TokenizeMsg(BaseTokenizerMsg):
     # Extra kwargs forwarded verbatim to `apply_chat_template` (e.g. {"enable_thinking": False} to
     # turn a reasoning model's thinking mode off). None = template defaults (thinking ON for Qwen3).
     chat_template_kwargs: Dict | None = None
+    # Raw encoded image files (PNG/JPEG/...), in the order their placeholders appear in the rendered
+    # prompt. Resolved to bytes by the frontend (data: URLs decoded, http(s) fetched) so the tokenizer
+    # worker never blocks on the network.
+    images: List[bytes] | None = None
 
 
 @dataclass

@@ -113,6 +113,33 @@ _FULL_CONTEXT_ATTENTION = frozenset({"full_attention", "qwen_sparse_attention"})
 _KNOWN_LAYER_TYPES = _FULL_CONTEXT_ATTENTION | {"linear_attention", "sliding_attention"}
 
 
+
+def _vision_fields(top) -> Optional[Dict]:
+    """The vision tower's geometry and the image special tokens, or None without a tower."""
+    from minisgl.tokenizer.vision import vision_tower_type
+
+    if vision_tower_type(top) is None:  # no tower, or one this engine does not implement
+        return None
+    vc = top.vision_config
+    d = vc.to_dict() if hasattr(vc, "to_dict") else dict(vc)
+    return {
+        "hidden_size": int(d["hidden_size"]),
+        "num_layers": int(d["num_hidden_layers"]),
+        "num_heads": int(d["num_attention_heads"]),
+        "head_dim": int(d.get("head_dim") or d["hidden_size"] // d["num_attention_heads"]),
+        "intermediate_size": int(d["intermediate_size"]),
+        "patch_size": int(d["patch_size"]),
+        "pooling_kernel_size": int(d["pooling_kernel_size"]),
+        "position_embedding_size": int(d["position_embedding_size"]),
+        "rms_norm_eps": float(d.get("rms_norm_eps", 1e-6)),
+        "rope_theta": float((d.get("rope_parameters") or {}).get("rope_theta", 100.0)),
+        "standardize": bool(d.get("standardize", False)),
+        "hidden_activation": d.get("hidden_activation", "gelu_pytorch_tanh"),
+        "image_token_id": int(top.image_token_id),
+        "boi_token_id": int(getattr(top, "boi_token_id")),
+        "eoi_token_id": int(getattr(top, "eoi_token_id")),
+    }
+
 @dataclass(frozen=True)
 class ModelConfig:
     num_layers: int
@@ -228,6 +255,10 @@ class ModelConfig:
     # nothing about it. None for every autoregressive model, which is what `is_block_diffusion` keys
     # on, so no path anywhere branches on a model name.
     canvas_length: int | None = None
+    # ---- Vision tower (Gemma-4 / DiffusionGemma). The checkpoint's `vision_config` as a plain dict plus
+    # the image special tokens, read from the TOP-LEVEL config; None for a text-only checkpoint. Built
+    # into a tower only when the checkpoint ships one — `models/gemma4_vision.py`.
+    vision: Dict | None = None
     # ---- Nemotron-H hybrid (Mamba-2 + MoE + a few global-attention layers). Populated by from_hf
     # ONLY when model_type == "nemotron_h".
     #
@@ -1105,6 +1136,7 @@ class ModelConfig:
             # it is read off `top` (which is `config` itself for a flat checkpoint). Absent -> None
             # -> is_block_diffusion False, and every canvas branch downstream stays dead.
             canvas_length=getattr(top, "canvas_length", None) or None,
+            vision=_vision_fields(top),
             linear_num_key_heads=linear_num_key_heads,
             gdn_output_gate=_norm_output_gate(getattr(config, "output_gate_type", None)),
             final_logit_softcapping=getattr(config, "final_logit_softcapping", None) or None,

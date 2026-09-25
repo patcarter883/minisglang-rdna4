@@ -375,6 +375,12 @@ class Engine:
                 with _bt.phase("oneshot_post_load"):
                     self.model.post_load()  # finalize weights (quantized layout conversion)
         _mem_probe("after post_load")
+        # Vision tower: one full-budget encode at boot, so the first image request does not pay for
+        # the tower's first kernel launches; its transients are released before KV sizing.
+        if getattr(self.model, "vision", None) is not None:
+            with _bt.phase("vision_warmup"):
+                self.model.vision.warmup()
+            torch.cuda.empty_cache()
         # THE ONE DECISION post_load MAKES THAT NO TENSOR RECORDS, checked across the ranks that made
         # it independently. A compressed-tensors int4 container decides its packed sign convention
         # from a SAMPLE of its own shard, and no two TP ranks hold the same bytes (plain TP splits
@@ -762,9 +768,12 @@ class Engine:
                 )
         except Exception:
             pass
+        # The final-logit softcap is applied exactly ONCE: by the model when its forward already caps
+        # (BaseLLMModel.applies_logit_softcap), otherwise here by the sampler.
         self.sampler = Sampler(self.device, config.model_config.vocab_size,
-                               real_vocab_size=_real_vocab,
-                               logit_softcap=getattr(config.model_config, "final_logit_softcapping", None))
+                               real_vocab_size=_real_vocab, tp_size=self.tp_size,
+                               logit_softcap=None if getattr(self.model, "applies_logit_softcap", False)
+                               else getattr(config.model_config, "final_logit_softcapping", None))
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
@@ -2149,12 +2158,87 @@ class Engine:
             start, end = ev.popleft()
             self.prefill_seconds_total += start.elapsed_time(end) / 1000.0
 
+    def _maybe_prepare_vision(self, batch: Batch) -> None:
+        """Every forward entry that can consume a PROMPT calls this (forward_batch for autoregressive
+        prefill, forward_verify for block diffusion's encoder pass). It is a no-op unless a request in
+        the batch carries images."""
+        if any(getattr(r, "mm", None) is not None for r in batch.reqs):
+            self._prepare_vision(batch)
+
+    def _prepare_vision(self, batch: Batch) -> None:
+        """Image soft tokens of this prefill chunk: encode what is not cached yet, then hand the model
+        the rows to merge and the attention its per-query key bounds.
+
+        * ENCODE: every image with at least one soft token in [cached_len, device_len) of its request
+          whose tower output is not already cached (a previous chunk of the same request may have
+          encoded it) — all such images of the batch in ONE tower call.
+        * MERGE: `batch.mm_merge = (rows, embeddings)`, rows into the packed batch; Gemma4Model writes
+          them over the placeholder embeddings. The placeholder ids themselves (content-hash pads
+          above the vocabulary) are replaced in the batch's own input_ids copy by the image token id,
+          so no embedding lookup ever sees an out-of-vocabulary id — the token pool and the radix
+          keys keep the pads.
+        * MASK: `attn_metadata.mm_hi`, the exclusive key bound of every packed query — its position
+          + 1, or its image's end for an image token (Gemma-4's sliding layers see a whole image).
+        * FREE: an image whose last soft token is in this chunk is done; its cached output goes.
+        """
+        vision = getattr(self.model, "vision", None)
+        reqs = batch.padded_reqs
+        dev = self.device
+        todo = []
+        for r in reqs:
+            mm = getattr(r, "mm", None)
+            if mm is None:
+                continue
+            for j, (a, b) in enumerate(mm.spans):
+                if max(a, r.cached_len) < min(b, r.device_len) and j not in mm.embeds:
+                    todo.append((mm, j))
+        if todo:
+            if vision is None:
+                raise RuntimeError("a request carries images but this model has no vision tower")
+            outs = vision.encode([mm.pixels(j, dev) for mm, j in todo])
+            for (mm, j), e in zip(todo, outs):
+                mm.embeds[j] = e
+                mm.release_pixels(j)
+
+        rows, src, hi_rows, hi_vals = [], [], [], []
+        base = 0
+        for r in reqs:
+            mm = getattr(r, "mm", None)
+            if mm is not None:
+                for j, (a, b) in enumerate(mm.spans):
+                    lo, up = max(a, r.cached_len), min(b, r.device_len)
+                    if lo >= up:
+                        continue
+                    first = base + lo - r.cached_len
+                    rows.append(torch.arange(first, first + (up - lo), device=dev))
+                    src.append(mm.embeds[j][lo - a: up - a])
+                    hi_rows.append(rows[-1])
+                    hi_vals.append(b)
+                    if up == b:
+                        del mm.embeds[j]
+                if r.device_len >= mm.spans[-1][1]:
+                    r.mm = None  # every image is prefilled: decode steps must not walk this again
+            base += r.extend_len
+        if not rows:
+            return
+        rows_t = torch.cat(rows)
+        batch.mm_merge = (rows_t, torch.cat(src))
+        image_token = vision.image_token_id
+        batch.input_ids.index_fill_(0, rows_t.to(batch.input_ids.device), image_token)
+        hi = (batch.positions.to(torch.int32) + 1)
+        for rr, b in zip(hi_rows, hi_vals):
+            hi[rr] = b
+        md = getattr(batch, "attn_metadata", None)
+        if md is not None:
+            md.mm_hi = hi.contiguous()
+
     def forward_batch(
         self, batch: Batch, args: BatchSamplingArgs, return_hidden: bool = False
     ):
         assert torch.cuda.current_stream() == self.stream
         _maybe_profile()
         extra = None
+        self._maybe_prepare_vision(batch)
         # GPU time for minisgl_prefill_seconds_total — the denominator of the "prefill throughput"
         # panel, which until now divided by a series the engine never exported and so rendered blank.
         _pf_ev = None
@@ -2193,20 +2277,10 @@ class Engine:
         for req in batch.reqs:
             req.complete_one()
 
+        # At TP>1 these are RANK 0's tokens on every rank (Sampler._rank0_tokens), grammar-masked or
+        # not, so the host sequences and the KV pools commit the same token everywhere.
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-        if args.grammar_bitmask is not None and self.tp_size > 1:
-            # Structured output at TP>1: the grammar bitmask makes per-rank token selection DIVERGE —
-            # it amplifies tiny cross-rank logit FP differences over the small allowed/renormalized
-            # set, so multinomial sampling (and, at a near-tie, even argmax) can pick a different token
-            # on each rank. Divergent commits desync the decode managers and deadlock the collectives
-            # (and KV would silently differ). Force rank0's tokens onto every rank for an identical
-            # commit (host seq + KV pool). Scoped to constrained batches; they already run the
-            # synchronous decode path, so the extra D2H + CPU broadcast is cheap.
-            next_tokens_cpu = next_tokens_gpu.to("cpu")
-            self.tp_cpu_group.broadcast(next_tokens_cpu, root=0).wait()
-            next_tokens_gpu = next_tokens_cpu.to(next_tokens_gpu.device)
-        else:
-            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         out = ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event,
@@ -2258,6 +2332,9 @@ class Engine:
         partial-K step, or a non-MLA backend — it falls back to the eager forward."""
         assert torch.cuda.current_stream() == self.stream
         _maybe_profile()  # count verify steps too, so MINISGL_PROFILE can trace the spec-verify path
+        # Block diffusion runs its PROMPT ENCODE through here (no sampling), so image prompts arrive
+        # on this path too, not only on forward_batch.
+        self._maybe_prepare_vision(batch)
         # v2 S4: the FUSED-TiDAR custom-mask verify forward has its own captured graph (distinct qlen +
         # a static dense mask). Check it first — its batch carries `fused_verify=True` and fused_qlen
         # query tokens, so it never collides with the K+1 two-forward verify graph below. Logits-only.
