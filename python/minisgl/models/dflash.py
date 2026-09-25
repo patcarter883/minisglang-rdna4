@@ -41,6 +41,7 @@ from typing import List, NamedTuple, Optional
 import torch
 import torch.nn.functional as F
 from minisgl.layers import RMSNorm, get_rope, silu_and_mul
+from minisgl.layers.attention import QKNormRope
 from minisgl.layers.base import BaseOP
 
 
@@ -265,6 +266,10 @@ class _DFlashLayer(BaseOP):
         # draft use the plain-weight convention, NOT the (1+weight) Qwen3.5 one).
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+        # The shared attention front end (q/k norm + RoPE, one launch where it applies) over the
+        # norms above. `_`-prefixed: it holds references, and must stay out of the state dict.
+        self._qk = QKNormRope(self.num_heads, self.num_kv_heads, head_dim, self.q_norm, self.k_norm,
+                              rotary)
         self.gate_proj = _PlainLinear(hidden_size, intermediate_size, shard=SHARD_COL)
         self.up_proj = _PlainLinear(hidden_size, intermediate_size, shard=SHARD_COL)
         self.down_proj = _PlainLinear(intermediate_size, hidden_size, shard=SHARD_ROW)
@@ -327,11 +332,7 @@ class _DFlashLayer(BaseOP):
         v_noise = self.v_proj.forward(x).view(B, Hkv, hd)
 
         # Per-head q_norm/k_norm over head_dim, then rotary on the noise block (prefix already rotated).
-        self.q_norm.forward_inplace(q)
-        self.k_norm.forward_inplace(k_noise)
-        q_flat, kn_flat = self._rotary.forward(
-            block_pos, q.reshape(B, H * hd).contiguous(), k_noise.reshape(B, Hkv * hd).contiguous()
-        )
+        q_flat, kn_flat, _ = self._qk.forward(q, k_noise, None, block_pos)
         q = q_flat.view(B, H, hd)
         k_noise = kn_flat.view(B, Hkv, hd)
 
@@ -391,12 +392,7 @@ class _DFlashLayer(BaseOP):
         q = self.q_proj.forward(x).view(T, H, hd)
         k_noise = self.k_proj.forward(x).view(T, Hkv, hd)
         v_noise = self.v_proj.forward(x).view(T, Hkv, hd)
-        self.q_norm.forward_inplace(q)
-        self.k_norm.forward_inplace(k_noise)
-        q_flat, kn_flat = self._rotary.forward(
-            block_pos.reshape(T), q.reshape(T, H * hd).contiguous(),
-            k_noise.reshape(T, Hkv * hd).contiguous()
-        )
+        q_flat, kn_flat, _ = self._qk.forward(q, k_noise, None, block_pos.reshape(T))
         # The block's K/V into each request's scratch columns [C, C+Q) of its own ring row.
         k_pool[slots, C:] = kn_flat.view(N, Q, Hkv, hd)
         v_pool[slots, C:] = v_noise.view(N, Q, Hkv, hd)

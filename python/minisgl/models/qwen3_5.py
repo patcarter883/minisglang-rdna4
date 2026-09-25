@@ -535,13 +535,11 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         B = x.shape[0]
         hd, nq, nkv = self._head_dim, self._num_qo_heads, self._num_kv_heads
         qg = self.q_proj.forward(x).view(B, nq, 2 * hd)
-        q = qg[..., :hd].reshape(B, nq * hd)
         gate = qg[..., hd:].reshape(B, nq * hd)
         k = self.k_proj.forward(x)
         v = self.v_proj.forward(x).view(B, nkv, hd)
-        self.q_norm.forward_inplace(q.view(B, nq, hd))
-        self.k_norm.forward_inplace(k.view(B, nkv, hd))
-        q, k = self.attn.rotary.forward(positions, q, k)
+        # The target layer's own front end (q/k norm + partial RoPE), so draft and target agree.
+        q, k, _ = self.attn.qk_prep.forward(qg[..., :hd], k, None, positions)
         # Persist this token's k/v into its slot at write_col (dynamic tensor index — capturable).
         k_buf[slot_rows, write_col] = k.view(B, nkv, hd)
         v_buf[slot_rows, write_col] = v
@@ -570,12 +568,10 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         S = x.shape[0]
         hd, nq, nkv = self._head_dim, self._num_qo_heads, self._num_kv_heads
         qg = self.q_proj.forward(x).view(S, nq, 2 * hd)
-        q = qg[..., :hd].reshape(S, nq * hd)   # gate half unused (only k/v are stored)
         k = self.k_proj.forward(x)
         v = self.v_proj.forward(x).view(S, nkv, hd)
-        self.q_norm.forward_inplace(q.view(S, nq, hd))
-        self.k_norm.forward_inplace(k.view(S, nkv, hd))
-        q, k = self.attn.rotary.forward(positions, q, k)
+        # gate half unused (only k/v are stored); q is still normed+roped as forward_draft_masked does.
+        q, k, _ = self.attn.qk_prep.forward(qg[..., :hd], k, None, positions)
         k = k.view(S, nkv, hd)
         k_buf[slot, start_col : start_col + S] = k
         v_buf[slot, start_col : start_col + S] = v

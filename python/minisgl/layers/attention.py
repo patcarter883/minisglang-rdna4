@@ -62,11 +62,126 @@ class AttentionLayer(StateLessOP):
         )
         self.q_norm = q_norm
         self.k_norm = k_norm
-        self._prep: tuple | None = None  # qk_norm_rope's per-layer constants, resolved on first use
+        # The q/k norm + RoPE front end, shared with the drafters that attend outside this class.
+        self.qk_prep = QKNormRope(
+            self.num_qo_heads, self.num_kv_heads, head_dim, q_norm, k_norm, self.rotary
+        )
+
+    def forward(self, qkv: torch.Tensor, selection: object | None = None) -> torch.Tensor:
+        q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
+        return self.forward_qkv(q, k, v, selection=selection)
+
+    def forward_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        v_norm_eps: float | None = None,
+        selection: object | None = None,
+    ) -> torch.Tensor:
+        """q/k norm -> RoPE -> attention, from SEPARATE q/k/v — views are fine: [n, heads*hd] with
+        any row stride (the split of a fused projection), or q as [n, heads, hd] with any head stride
+        (Qwen3.5's q, interleaved per head with its gate). Callers holding three projection outputs
+        pass them straight here instead of `torch.cat`-ing them for `forward` to split again.
+
+        `v_norm_eps`: also apply the scale-less RMSNorm to v (Gemma-4's `v_norm`). v may BE k (a
+        Gemma-4 full layer's V is k_proj's raw output): nothing here writes into the inputs before v
+        has been read.
+
+        `selection` is a `minisgl.attention.qsa.QSASelection` on a QSA full-attention layer.
+        It changes exactly ONE thing: which backend entry point the (already normed, already roped)
+        q/k/v go to. Everything above that line — the q/k norms, the partial rotary, the contiguity
+        invariant — is byte-identical between the dense and the sparse call, which is what makes
+        "sparse == dense when the selection is everything" a statement about the attention kernel
+        alone rather than about two independently-assembled forwards."""
+        ctx = get_global_ctx()
+        q, k, v = self.qk_prep.forward(q, k, v, ctx.batch.positions, v_norm_eps=v_norm_eps)
+        q = q.view(-1, self.num_qo_heads, self.head_dim)
+        if selection is not None:
+            o = ctx.attn_backend.forward_sparse(
+                q, k, v, self.layer_id, ctx.batch, selection.slots, selection.lens
+            )
+        else:
+            o = ctx.attn_backend.forward(
+                q, k, v, self.layer_id, ctx.batch, sliding_window=self.sliding_window
+            )
+        return o.view(-1, self.qo_attn_dim)
+
+
+class QKNormRope(StateLessOP):
+    """The attention front end: per-head q/k norm, then RoPE (and, for Gemma-4, v's scale-less norm).
+
+    ONE launch (tail_hip.qk_norm_rope) where the kernel can express the layer — for what is otherwise
+    q_norm + k_norm (a norm and a copy_ back each), rope's two .contiguous() copies and two rope
+    launches, plus Gemma-4's v_norm — and otherwise exactly that op chain. Bit-identical either way
+    (tail/tests/test_qk_norm_rope.py), so which one ran is a performance fact, never a numerics one.
+    Owned by every AttentionLayer, and by the drafters that attend outside one (DFlash, the Qwen3.5
+    draft-KV ring) so they cannot drift from it. Holds references to its norms, not copies: the
+    owning model's attributes are what the loader fills."""
+
+    def __init__(
+        self,
+        num_qo_heads: int,   # LOCAL (post-TP) head counts
+        num_kv_heads: int,
+        head_dim: int,
+        q_norm: RMSNorm | RMSNormNoScale | None,
+        k_norm: RMSNorm | RMSNormNoScale | None,
+        rotary: object | None,  # layers.rotary RoPE, or None for NoPE
+    ):
+        self.num_qo_heads, self.num_kv_heads, self.head_dim = num_qo_heads, num_kv_heads, head_dim
+        self.qo_attn_dim, self.kv_attn_dim = num_qo_heads * head_dim, num_kv_heads * head_dim
+        self.q_norm, self.k_norm, self.rotary = q_norm, k_norm, rotary
+        self._prep: tuple | None = None  # the kernel's per-layer constants, resolved on first use
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor | None,
+        positions: torch.Tensor,
+        *,
+        v_norm_eps: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """q: [n, hq*hd] (any row stride) or [n, hq, hd] (any head stride); k/v: [n, hk*hd] or
+        [n, hk, hd]. Returns contiguous [n, hq*hd] q and [n, hk*hd] k, and v — normed and contiguous
+        when `v_norm_eps` is given, else passed through untouched. v may BE k (a Gemma-4 full layer's V
+        is k_proj's raw output): nothing is written into the inputs before v has been read. The
+        fallback chain norms q/k IN PLACE, so callers must not rely on their q/k inputs afterwards."""
+        vs = () if v is None else (v,)
+        prep = self._fused_prep(q.dtype, v_norm_eps) if _tail_hip.active(q, k, *vs) else False
+        if prep and _rows_aligned(q, k, *vs):
+            q_w, k_w, cache, rd, do_norm, plus_one, eps = prep
+            q, k, vn = _tail_hip.qk_norm_rope(
+                q, k, v if v_norm_eps is not None else None, q_w, k_w,
+                positions.to(torch.int32), cache, self.num_qo_heads, self.num_kv_heads,
+                self.head_dim, rd, do_norm, plus_one, eps,
+            )
+            return q, k, (vn if v_norm_eps is not None else v)
+        n = q.shape[0]
+        q = q.reshape(n, self.qo_attn_dim)
+        if v_norm_eps is not None:
+            v = _rms_norm(v.reshape(-1, self.head_dim), None, v_norm_eps).view(n, -1)
+        if self.q_norm is not None:
+            self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
+        if self.k_norm is not None:
+            self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
+        if self.rotary is not None:
+            q, k = self.rotary.forward(positions, q, k.reshape(n, self.kv_attn_dim))
+        else:
+            # NoPE. `qkv.split` hands back NON-CONTIGUOUS views (stride = the fused row width), and
+            # every roped model is handed contiguous q/k only as a SIDE EFFECT of rope, which does
+            # `query.contiguous()` internally and returns fresh tensors. With rope skipped that
+            # invariant silently lapses, and the HIP decode kernel rejects it — `attn_decode: q must
+            # be contiguous`, raised during graph capture, i.e. at boot rather than in a way any
+            # numeric test would surface. Restore the invariant explicitly instead of relying on a
+            # neighbouring op to launder it.
+            q, k = q.contiguous(), k.reshape(n, self.kv_attn_dim).contiguous()
+        return q, k, v
 
     def _fused_prep(self, dtype: torch.dtype, v_norm_eps: float | None) -> tuple | bool:
         """The layer's arguments to `tail_hip.qk_norm_rope`, or False when the fused front end
-        cannot express this layer — which then runs the op chain below, unchanged. Resolved once,
+        cannot express this layer — which then runs the op chain in `forward`, unchanged. Resolved once,
         after load (the norm gains' dtype is only final then)."""
         if self._prep is not None and self._prep[0] == (dtype, v_norm_eps):
             return self._prep[1]
@@ -101,80 +216,6 @@ class AttentionLayer(StateLessOP):
             return False
         rd, cache = (0, None) if rot is None else (rot.rotary_dim, rot._cos_sin_cache)
         return q_w, k_w, cache, rd, do_norm, int(plus_one), (v_norm_eps if v_norm_eps is not None else eps)
-
-    def forward(self, qkv: torch.Tensor, selection: object | None = None) -> torch.Tensor:
-        q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
-        return self.forward_qkv(q, k, v, selection=selection)
-
-    def forward_qkv(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        v_norm_eps: float | None = None,
-        selection: object | None = None,
-    ) -> torch.Tensor:
-        """q/k norm -> RoPE -> attention, from SEPARATE q/k/v — views are fine: [n, heads*hd] with
-        any row stride (the split of a fused projection), or q as [n, heads, hd] with any head stride
-        (Qwen3.5's q, interleaved per head with its gate). Callers holding three projection outputs
-        pass them straight here instead of `torch.cat`-ing them for `forward` to split again.
-
-        `v_norm_eps`: also apply the scale-less RMSNorm to v (Gemma-4's `v_norm`). v may BE k (a
-        Gemma-4 full layer's V is k_proj's raw output): nothing here writes into the inputs before v
-        has been read.
-
-        `selection` is a `minisgl.attention.qsa.QSASelection` on a QSA full-attention layer.
-        It changes exactly ONE thing: which backend entry point the (already normed, already roped)
-        q/k/v go to. Everything above that line — the q/k norms, the partial rotary, the contiguity
-        invariant — is byte-identical between the dense and the sparse call, which is what makes
-        "sparse == dense when the selection is everything" a statement about the attention kernel
-        alone rather than about two independently-assembled forwards."""
-        ctx = get_global_ctx()
-        n = q.shape[0]
-        prep = self._fused_prep(q.dtype, v_norm_eps) if _tail_hip.active(q, k, v) else False
-        if prep and _rows_aligned(q, k, v):
-            # ONE launch (tail_hip.qk_norm_rope) for what is otherwise q_norm + k_norm (a norm and a
-            # copy_ back each), rope's two .contiguous() copies and two rope launches — plus, for
-            # Gemma-4, v_norm and the cat. Bit-identical to that chain (tail/tests/test_qk_norm_rope.py);
-            # writes the contiguous q/k(/v) the backend requires.
-            q_w, k_w, cache, rd, do_norm, plus_one, eps = prep
-            q, k, vn = _tail_hip.qk_norm_rope(
-                q, k, v if v_norm_eps is not None else None, q_w, k_w,
-                ctx.batch.positions.to(torch.int32), cache, self.num_qo_heads, self.num_kv_heads,
-                self.head_dim, rd, do_norm, plus_one, eps,
-            )
-            if v_norm_eps is not None:
-                v = vn
-        else:
-            q = q.reshape(n, self.qo_attn_dim)
-            if v_norm_eps is not None:
-                v = _rms_norm(v.reshape(-1, self.head_dim), None, v_norm_eps).view(n, -1)
-            if self.q_norm is not None:
-                self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
-            if self.k_norm is not None:
-                self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
-            if self.rotary is not None:
-                q, k = self.rotary.forward(ctx.batch.positions, q, k)
-            else:
-                # NoPE. `qkv.split` hands back NON-CONTIGUOUS views (stride = the fused row width),
-                # and every roped model is handed contiguous q/k only as a SIDE EFFECT of rope, which
-                # does `query.contiguous()` internally and returns fresh tensors. With rope skipped
-                # that invariant silently lapses, and the HIP decode kernel rejects it — `attn_decode:
-                # q must be contiguous`, raised during graph capture, i.e. at boot rather than in a way
-                # any numeric test would surface. Restore the invariant explicitly instead of relying
-                # on a neighbouring op to launder it.
-                q, k = q.contiguous(), k.contiguous()
-        q = q.view(-1, self.num_qo_heads, self.head_dim)
-        if selection is not None:
-            o = ctx.attn_backend.forward_sparse(
-                q, k, v, self.layer_id, ctx.batch, selection.slots, selection.lens
-            )
-        else:
-            o = ctx.attn_backend.forward(
-                q, k, v, self.layer_id, ctx.batch, sliding_window=self.sliding_window
-            )
-        return o.view(-1, self.qo_attn_dim)
 
 
 def _rows_aligned(*ts: torch.Tensor) -> bool:
