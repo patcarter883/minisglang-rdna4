@@ -412,6 +412,7 @@ def _build_vision(config: "ModelConfig"):
     return Gemma4VisionTower(config.vision, config.hidden_size)
 
 class Gemma4ForConditionalGeneration(BaseLLMModel):
+    applies_logit_softcap = True  # forward() caps; the sampler must not cap again
     def __init__(self, config: "ModelConfig"):
         # Only the routed experts are quantized; the attention projections, the dense MLP, the
         # router and lm_head are all in the checkpoint's ignore list. The backbone keeps the real

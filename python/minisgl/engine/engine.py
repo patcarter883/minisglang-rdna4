@@ -762,9 +762,12 @@ class Engine:
                 )
         except Exception:
             pass
+        # The final-logit softcap is applied exactly ONCE: by the model when its forward already caps
+        # (BaseLLMModel.applies_logit_softcap), otherwise here by the sampler.
         self.sampler = Sampler(self.device, config.model_config.vocab_size,
                                real_vocab_size=_real_vocab,
-                               logit_softcap=getattr(config.model_config, "final_logit_softcapping", None))
+                               logit_softcap=None if getattr(self.model, "applies_logit_softcap", False)
+                               else getattr(config.model_config, "final_logit_softcapping", None))
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")

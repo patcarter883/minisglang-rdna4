@@ -121,6 +121,7 @@ class DiffusionGemmaModel(Gemma4Model):
 
 
 class DiffusionGemmaForBlockDiffusion(BaseLLMModel):
+    applies_logit_softcap = True  # forward() and the canvas head cap; the sampler must not cap again
     def __init__(self, config: "ModelConfig"):
         self.model = DiffusionGemmaModel(config, expert_quant=config.quant)
         self.lm_head = ParallelLMHead(

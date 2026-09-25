@@ -155,8 +155,9 @@ class Sampler:
     # no mask (a tokenizer that could not be loaded must not silently disable sampling).
     real_vocab_size: int | None = None
     # Gemma2-style final-logit soft cap (config `final_logit_softcapping`): logits are squashed to
-    # (-cap, cap) via cap*tanh(l/cap) before any masking/sampling — an outlier-logit clamp both
-    # reference engines apply at the head. None (every current checkpoint) = no-op.
+    # (-cap, cap) via cap*tanh(l/cap) before any masking/sampling. Set ONLY for a model whose forward
+    # does not cap itself (BaseLLMModel.applies_logit_softcap) — capping twice flattens the
+    # distribution (see there). None = no-op.
     logit_softcap: float | None = None
     # uid -> [vocab] float32 count of tokens that request has generated. Created lazily for penalised
     # requests only (~1 MB each at a 248k vocab) and updated incrementally by one index_add per step,
