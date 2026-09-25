@@ -53,7 +53,8 @@ write_yml() {  # $1 = command line, $2... = extra "KEY: val" env lines
     for kv in "$@"; do echo "      $kv"; done
   } > "$YMLF"
 }
-DC() { ( cd "$WT" && env MINISGL_IMAGE="$IMAGE" docker compose -f docker-compose.yml -f "$YMLF" --profile serve "$@" ); }
+# COMPOSE_EXTRA: an additional compose file (e.g. a kernel-package bind-mount override) for BOTH legs.
+DC() { ( cd "$WT" && env MINISGL_IMAGE="$IMAGE" docker compose -f docker-compose.yml ${COMPOSE_EXTRA:+-f "$COMPOSE_EXTRA"} -f "$YMLF" --profile serve "$@" ); }
 down() { DC down >/dev/null 2>&1; }
 trap 'down; rm -f "$YMLF"' EXIT INT TERM
 
