@@ -42,7 +42,7 @@ from minisgl.layers.norm import RMSNormNoScale
 from minisgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
-from .gemma4 import Gemma4DenseMLP, Gemma4Model
+from .gemma4 import Gemma4DenseMLP, Gemma4Model, _build_vision
 
 if TYPE_CHECKING:
     from minisgl.quant.config import QuantConfig
@@ -130,6 +130,7 @@ class DiffusionGemmaForBlockDiffusion(BaseLLMModel):
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
         self._softcap = config.final_logit_softcapping
+        self.vision = _build_vision(config)
         super().__init__()
 
     def _softcapped(self, logits: torch.Tensor) -> torch.Tensor:

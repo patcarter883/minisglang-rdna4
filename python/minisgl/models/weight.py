@@ -2696,6 +2696,15 @@ def _load_gemma4_weight(
                 if ckpt_name.startswith(_GEMMA4_ENCODER_TEXT):
                     tie_encoder[_gemma4_tie_check_key(ckpt_name)] = f.get_tensor(ckpt_name)
                     continue
+                if ckpt_name.startswith(_GEMMA4_SKIP_PREFIXES):
+                    # The vision tower + projector: REPLICATED (never TP-sharded, never gate/up
+                    # merged — the tower fuses its own weights in post_load), and loaded only when
+                    # the model built a tower (ModelConfig.vision); otherwise skipped as before.
+                    if getattr(config, "vision", None):
+                        from .gemma4_vision import gemma4_vision_remap
+
+                        yield gemma4_vision_remap(ckpt_name), f.get_tensor(ckpt_name)
+                    continue
                 native = _gemma4_remap(ckpt_name)
                 if native is None:
                     continue

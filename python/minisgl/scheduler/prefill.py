@@ -149,6 +149,11 @@ class PrefillAdder:
             if aligned_end <= cached_len:
                 return None
             chunk_size = aligned_end - cached_len
+        # Never end a chunk inside an image (see minisgl.multimodal). Applied LAST so it has the final
+        # say over the budget and alignment rounding above: an image split across two forwards would
+        # compute its first half without seeing its second.
+        if pending_req.mm is not None and cached_len + chunk_size < pending_req.input_len:
+            chunk_size = pending_req.mm.clip_chunk_end(cached_len, cached_len + chunk_size) - cached_len
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
@@ -157,7 +162,7 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
-        return CLS(
+        req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
             cached_len=cached_len,
@@ -166,6 +171,8 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
         )
+        req.mm = pending_req.mm
+        return req
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
         if self.token_budget <= 0:
@@ -214,7 +221,12 @@ class PrefillManager:
     chunk_gran: int = 1
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
+        mm = None
+        if getattr(req, "mm_images", None):
+            from minisgl.multimodal import ReqVision
+
+            mm = ReqVision(req.mm_images)
+        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params, mm=mm))
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

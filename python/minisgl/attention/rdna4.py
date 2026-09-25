@@ -88,6 +88,10 @@ class RDNA4Metadata(BaseAttnMetadata):
     # never leaks across forwards; cu_seqlens_q / cache_seqlens are never mutated between layers.)
     _cu_seqlens_q_list: List[int] | None = None
     _cache_seqlens_list: List[int] | None = None
+    # Image prefill (Gemma-4): per PACKED query, the exclusive end of the keys it may read — position+1,
+    # or its image's end for an image token. Set by Engine._prepare_vision; None on every batch without
+    # images. Only the sliding layers read it (the full layers are causal-only in this architecture).
+    mm_hi: torch.Tensor | None = None
 
     def cu_seqlens_q_list(self) -> List[int]:
         """`cu_seqlens_q.tolist()`, computed once per forward and cached (host sync)."""
@@ -607,10 +611,11 @@ class RDNA4Backend(BaseAttnBackend):
             if e - s <= 0:
                 continue
             win = windows[i]
+            hi_abs = None if metadata.mm_hi is None else metadata.mm_hi[s:e]
             if win is None:  # cold seq in a mixed batch: plain windowed prefill over its own tokens
                 out[s:e] = self._hip_prefill_op(
                     q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
-                    scale, 1, window,
+                    scale, 1, window, None, hi_abs,
                 )
                 continue
             pad, k_win, v_win = win  # [Wp, Hk, D]
@@ -624,7 +629,14 @@ class RDNA4Backend(BaseAttnBackend):
             k_ext = torch.cat(parts_k, dim=0).contiguous()
             v_ext = torch.cat(parts_v, dim=0).contiguous()
             q_ext = torch.cat([q.new_zeros((front, q.shape[1], D)), q[s:e]], dim=0).contiguous()
-            out_ext = self._hip_prefill_op(q_ext, k_ext, v_ext, scale, 1, window)
+            hi_ext = None
+            if hi_abs is not None:
+                # [pad | window | new] coordinates: absolute p -> p - cached_len + front. The front rows
+                # are zero queries whose output is dropped; they keep the causal bound.
+                cached_len = metadata.cache_seqlens_list()[i] - (e - s)
+                hi_ext = torch.cat([torch.arange(1, front + 1, device=hi_abs.device, dtype=torch.int32),
+                                    hi_abs - cached_len + front]).contiguous()
+            out_ext = self._hip_prefill_op(q_ext, k_ext, v_ext, scale, 1, window, None, hi_ext)
             out[s:e] = out_ext[front:]
         return out
 
@@ -714,9 +726,11 @@ class RDNA4Backend(BaseAttnBackend):
             s, e = cu[i], cu[i + 1]
             if e - s <= 0:
                 continue
+            hi = None if metadata.mm_hi is None else metadata.mm_hi[s:e]  # cold: absolute == local
             out[s:e] = self._hip_prefill_op(
                 q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
                 scale, 1, window,  # causal=1, sliding_window=window
+                None, hi,
             )
         return out
 

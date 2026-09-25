@@ -35,7 +35,7 @@ from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from .metrics import BackendSnapshot, FrontendMetrics
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from starlette.background import BackgroundTask
 
 from .args import ServerArgs
@@ -119,17 +119,72 @@ class Message(BaseModel):
     # (`preserve_thinking` true when undefined). Templates that don't read the key ignore it.
     reasoning_content: str | None = None
 
+    # Image sources of this message's content parts, in order (URLs / data URLs). Private: never dumped
+    # into the template dict; the chat endpoint resolves them to bytes for the tokenizer.
+    _images: List[str] = PrivateAttr(default_factory=list)
+
     @model_validator(mode="after")
     def _flatten_content_parts(self) -> "Message":
-        """OpenAI array-of-parts content -> a plain string the chat template consumes. Concatenates the
-        `text` parts (in order); non-text parts (e.g. image_url) are ignored for this text model. A
-        plain-string content is left untouched."""
+        """OpenAI array-of-parts content -> a plain string the chat template consumes. Text parts are
+        concatenated in order; each IMAGE part becomes one image sentinel at its position (the tokenizer
+        swaps it for the model's own image token after the template runs) and its source is kept on
+        the message. Content stays a string everywhere, so nothing downstream that string-processes
+        messages has to learn about parts. A plain-string content is left untouched."""
         if isinstance(self.content, list):
-            self.content = "".join(
-                p.get("text", "") for p in self.content
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
+            from minisgl.tokenizer.vision import IMAGE_SENTINEL
+
+            pieces: List[str] = []
+            for p in self.content:
+                if not isinstance(p, dict):
+                    continue
+                kind = p.get("type")
+                if kind == "text":
+                    pieces.append(p.get("text", ""))
+                elif kind in ("image_url", "input_image", "image"):
+                    src = p.get("image_url", p.get("image"))
+                    if isinstance(src, dict):
+                        src = src.get("url")
+                    if isinstance(src, str) and src:
+                        self._images.append(src)
+                        pieces.append(IMAGE_SENTINEL)
+            self.content = "".join(pieces)
         return self
+
+
+_IMAGE_MAX_BYTES = 32 << 20
+_IMAGE_FETCH_TIMEOUT_S = 20.0
+
+
+async def _resolve_images(messages: "List[Message] | None") -> List[bytes]:
+    """Every image part of the conversation, as raw file bytes, in placeholder order.
+
+    data: URLs are decoded here; http(s) URLs are fetched off the event loop with a size cap and a
+    timeout, so the tokenizer worker (synchronous, shared by every request) never waits on the
+    network. Anything else is refused rather than guessed at — in particular no local file paths."""
+    import base64
+    import urllib.request
+
+    srcs = [s for m in (messages or []) for s in m._images]
+    out: List[bytes] = []
+    for src in srcs:
+        if src.startswith("data:"):
+            head, _, body = src.partition(",")
+            if ";base64" not in head:
+                raise ValueError("image data URLs must be base64-encoded")
+            data = base64.b64decode(body, validate=False)
+        elif src.startswith(("http://", "https://")):
+            def _get(url: str = src) -> bytes:
+                rq = urllib.request.Request(url, headers={"User-Agent": "minisgl"})
+                with urllib.request.urlopen(rq, timeout=_IMAGE_FETCH_TIMEOUT_S) as r:
+                    blob = r.read(_IMAGE_MAX_BYTES + 1)
+                return blob
+            data = await asyncio.to_thread(_get)
+        else:
+            raise ValueError("image_url must be a data: URL or an http(s) URL")
+        if len(data) > _IMAGE_MAX_BYTES:
+            raise ValueError(f"image larger than {_IMAGE_MAX_BYTES >> 20} MiB")
+        out.append(data)
+    return out
 
 
 # Output cap for a request that sets NEITHER `max_tokens` NOR `max_completion_tokens`.
@@ -3688,6 +3743,14 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         _schedule_cam_auto_write(_last_user or "", override=req.cam_write, ns=_cam_ns)  # off critical path
     prompt = await _cam_auto_augment(prompt, ns=_cam_ns, override=req.cam_read)     # TRANSPARENT CAM read
 
+    # Image parts -> raw bytes, off the event loop; the tokenizer does the pixel work.
+    try:
+        _images = await _resolve_images(req.messages) if req.messages else []
+    except Exception as _img_err:  # noqa: BLE001
+        return JSONResponse(status_code=400, content={"error": {
+            "message": f"could not load image input: {_img_err}", "type": "invalid_request_error",
+            "param": "messages", "code": "invalid_image"}})
+
     uid = state.new_user()
     # Constrained decoding: response_format wins; else a FORCED tool call (tool_choice required /
     # specific) gets its own JSON-schema grammar so the arguments are schema-checked and terminate.
@@ -3697,6 +3760,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         TokenizeMsg(
             uid=uid,
             text=prompt,
+            images=_images or None,
             tools=_tools_for_template(req),
             chat_template_kwargs=_resolve_chat_template_kwargs(req, state.config.model_path),
             sampling_params=SamplingParams(

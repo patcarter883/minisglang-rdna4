@@ -392,10 +392,24 @@ class Gemma4Model(BaseOP):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         h = self._embed_scaled(input_ids)
+        # Image soft tokens: the vision tower's rows replace the placeholder embeddings (the reference
+        # masked_scatter). Prepared per batch by Engine._prepare_vision; None on every text-only batch.
+        mm = getattr(get_global_ctx().batch, "mm_merge", None)
+        if mm is not None:
+            h.index_copy_(0, mm[0], mm[1].to(h.dtype))
         for layer in self.layers.op_list:
             h = layer.forward(h)
         return self.norm.forward(h)
 
+
+
+def _build_vision(config: "ModelConfig"):
+    """The checkpoint's vision tower, when it ships one (ModelConfig.vision); None for text-only."""
+    if not getattr(config, "vision", None):
+        return None
+    from .gemma4_vision import Gemma4VisionTower
+
+    return Gemma4VisionTower(config.vision, config.hidden_size)
 
 class Gemma4ForConditionalGeneration(BaseLLMModel):
     def __init__(self, config: "ModelConfig"):
@@ -411,6 +425,7 @@ class Gemma4ForConditionalGeneration(BaseLLMModel):
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
         self._softcap = config.final_logit_softcapping
+        self.vision = _build_vision(config)
         super().__init__()
 
     def forward(self, return_hidden: bool = False):

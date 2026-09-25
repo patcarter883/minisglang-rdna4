@@ -78,7 +78,7 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, tokenizer_path)
     detokenize_manager = DetokenizeManager(
         tokenizer, resolve_stop_token_ids(tokenizer_path, tokenizer)
     )
@@ -211,10 +211,25 @@ def tokenize_worker(
                         stop_map[msg.uid] = list(msg.sampling_params.stop)
                     if msg.sampling_params.stop_keep:
                         keep_map[msg.uid] = list(msg.sampling_params.stop_keep)
-                user_msgs = [
-                    UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                    for msg, t in zip(tokenize_msg, tensors, strict=True)
-                ]
+                mm = tokenize_manager.last_mm or [(None, None)] * len(tokenize_msg)
+                user_msgs = []
+                rejected: List[UserReply] = []
+                for msg, t, (mm_images, err) in zip(tokenize_msg, tensors, mm, strict=True):
+                    if err is not None:
+                        # A bad image fails its own request here, before any engine state exists.
+                        prompt_tokens_map.pop(msg.uid, None)
+                        stop_map.pop(msg.uid, None)
+                        keep_map.pop(msg.uid, None)
+                        rejected.append(UserReply(uid=msg.uid, incremental_output="", finished=True,
+                                                  completion_tokens=0, prompt_tokens=0,
+                                                  finish_reason="error", error=err))
+                        continue
+                    prompt_tokens_map[msg.uid] = int(t.numel())
+                    user_msgs.append(UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params,
+                                             mm_images=mm_images))
+                if rejected:
+                    send_frontend.put(rejected[0] if len(rejected) == 1
+                                      else BatchFrontendMsg(data=list(rejected)))
                 # Per-replica routing: bucket each UserMsg to ONE replica (round-robin), then flush one
                 # batch per replica. Each request is delivered to exactly one DP replica. EXCEPTION: CAM
                 # store ops are PINNED to a single replica (MINISGL_CAM_DP_RANK, default 0) so every
