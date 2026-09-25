@@ -3,11 +3,27 @@ import dataclasses
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Collection, Dict, Tuple
+from typing import Any, Collection, Dict, Optional, Tuple
 from transformers import PretrainedConfig
 
 from minisgl.quant.config import QuantConfig
 
+
+def _full_layer_override(config, attr: str, layer_types) -> Optional[int]:
+    """`attr` on the first full-attention layer, when transformers holds it as a PER-LAYER override.
+
+    transformers 5.17 folds Gemma-4's `global_head_dim` / `num_global_key_value_heads` into
+    per-layer overrides of `head_dim` / `num_key_value_heads` and DROPS the original fields, so
+    `getattr(config, "global_head_dim")` is None there and the full layers would silently be built at
+    the sliding geometry (256/8 instead of 512/2). None when the config carries no per-layer view
+    (older transformers, which keep the global_* fields) or no full-attention layer."""
+    view = config.__dict__.get("_heterogeneity_spec") and getattr(config, "per_layer_config", None)
+    if view is None or not layer_types:
+        return None
+    for i, t in enumerate(layer_types):
+        if t == "full_attention":
+            return getattr(view[i], attr, None)
+    return None
 
 @dataclass(frozen=True)
 class RotaryConfig:
@@ -969,12 +985,16 @@ class ModelConfig:
                 attention_k_eq_v = True
         attention_k_eq_v = bool(attention_k_eq_v)
         if _is_gemma4:
-            _global_head_dim = getattr(config, "global_head_dim", None)
+            _global_head_dim = getattr(config, "global_head_dim", None) or _full_layer_override(
+                config, "head_dim", layer_types
+            )
             if _global_head_dim:
                 swa_head_dim, head_dim = head_dim, _global_head_dim
                 swa_num_kv_heads, num_kv_heads = (
                     num_kv_heads,
-                    getattr(config, "num_global_key_value_heads", None) or num_kv_heads,
+                    getattr(config, "num_global_key_value_heads", None)
+                    or _full_layer_override(config, "num_key_value_heads", layer_types)
+                    or num_kv_heads,
                 )
         if layer_types is not None and any(t == "sliding_attention" for t in layer_types):
             # Per-layer QO head counts (Laguna: 48 full / 64 sliding).

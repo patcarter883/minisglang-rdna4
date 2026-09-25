@@ -256,6 +256,7 @@ def main() -> int:
     )
 
     check_vocab_parallel(rep)
+    check_fused_vocab_parallel(rep)
 
     print(f"\n{'PASS' if rep.failures == 0 else f'FAIL ({rep.failures} checks)'}")
     return 1 if rep.failures else 0
@@ -398,6 +399,113 @@ def check_vocab_parallel(rep: Report) -> None:
         f"{len(drawn)} distinct ids over 48 draws from a flat {VOCAB}-way distribution; a broken "
         f"ownership test would pin every draw to one rank's first or last column",
     )
+
+
+def check_fused_vocab_parallel(rep: Report) -> None:
+    """[6] The FUSED native tail (`fused_sharded_canvas_tail`) == the whole-vocabulary tail.
+
+    The served TP path runs this one, not `sharded_canvas_tail`: it takes the RAW logits plus the
+    softcap and temperature, and three native kernels (sampler_hip.canvas_tail_*) replace the torch
+    passes. Same SPMD thread harness and the same claims as [5], on CUDA — except that `probs` comes
+    back in fp16 (the soft embedding's contraction dtype), so it is held to fp16 rounding, and the
+    collectives are three rather than four (the sum-exp all_reduce folds into the first gather).
+    """
+    import threading
+
+    from minisgl.diffusion import normalized_probs
+    from minisgl.diffusion.sampler import fused_canvas_tail_available, fused_sharded_canvas_tail
+
+    print("\n[6] the FUSED native vocab-parallel tail == the whole-vocabulary tail")
+    if not torch.cuda.is_available() or not fused_canvas_tail_available():
+        print("  SKIP no GPU or no sampler_hip.canvas_tail_* in this image — the served TP canvas "
+              "tail is NOT covered by this run")
+        return
+    SIZE, dev, CAP, T = 2, torch.device("cuda"), 30.0, 0.8
+    V = 4096                      # > one 128-element CDF tile per shard, and a multiple of 4
+    width = V // SIZE
+    torch.manual_seed(77)
+    raw = (torch.randn(CANVAS, V) * 3.0).to(dev)
+
+    class _ThreadShard:
+        def __init__(self, rank, barrier, slot):
+            self.size, self.rank = SIZE, rank
+            self.start, self.width = rank * width, width
+            self._barrier, self._slot = barrier, slot
+
+        def _exchange(self, x):
+            self._slot[self.rank] = x
+            self._barrier.wait()
+            out = list(self._slot)
+            self._barrier.wait()
+            return out
+
+        def gather(self, x):
+            return torch.stack(self._exchange(x.clone()))
+
+        def total(self, x):
+            return torch.stack(self._exchange(x.clone())).sum(dim=0)
+
+    def spmd(block, seeds):
+        barrier, slot, out = threading.Barrier(SIZE), [None] * SIZE, [None] * SIZE
+
+        def run(rank):
+            gen = torch.Generator(device=dev).manual_seed(seeds[rank])
+            local = block[:, rank * width : (rank + 1) * width].contiguous()
+            out[rank] = fused_sharded_canvas_tail(
+                local, _ThreadShard(rank, barrier, slot), V, gen, CAP, T)
+            torch.cuda.synchronize()
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(SIZE)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        return out, threads
+
+    out, threads = spmd(raw, [4321, 8765])
+    if not rep.check("both ranks returned (no collective-ordering deadlock)",
+                     all(o is not None for o in out) and not any(t.is_alive() for t in threads),
+                     f"{sum(o is not None for o in out)}/{SIZE} ranks completed"):
+        return
+    scaled = (torch.tanh(raw / CAP) * CAP) / T
+    log_probs, probs = normalized_probs(scaled)
+    want_entropy = -(probs * log_probs).sum(dim=-1)
+    want_argmax = torch.argmax(scaled, dim=-1)
+    # Held to what the served path always did with this tensor: the reference softmax CAST TO fp16
+    # (`soft_embedding` casts before its GEMM). Within one fp16 ulp, because the fp32 value it rounds
+    # from comes out of a differently-associated denominator; probabilities below fp16's smallest
+    # subnormal are 0 in both.
+    ulps = max(((out[r][0].float() - probs[:, r * width:(r + 1) * width].half().float()).abs()
+                / (probs[:, r * width:(r + 1) * width].half().float() * 2 ** -10 + 2 ** -24)).max().item()
+               for r in range(SIZE))
+    rep.check("probs shard == the global softmax's columns, in fp16", ulps <= 1.0,
+              f"max |delta| = {ulps:.2f} fp16 ulp of the reference cast")
+    de = max((out[r][1] - want_entropy).abs().max().item() for r in range(SIZE))
+    rep.check("entropy == the whole-vocabulary entropy", de < 1e-5, f"max|delta|={de:.3e}")
+    rep.check("argmax == torch.argmax over the whole row, on EVERY rank",
+              all(torch.equal(out[r][2], want_argmax) for r in range(SIZE)),
+              f"mismatches={int((out[0][2] != want_argmax).sum())} of {CANVAS}")
+    rep.check("the draw is identical on every rank (different generators!)",
+              all(torch.equal(out[r][3], out[0][3]) for r in range(SIZE)),
+              f"rank0 sampled[:6]={out[0][3][:6].tolist()} rank1 sampled[:6]={out[1][3][:6].tolist()}")
+    rep.check("the renoise is identical on every rank (different generators!)",
+              all(torch.equal(out[r][4], out[0][4]) for r in range(SIZE)),
+              f"rank0 noise[:6]={out[0][4][:6].tolist()}")
+    sampled = out[0][3]
+    p_sampled = probs[torch.arange(CANVAS, device=dev), sampled]
+    rep.check("every sampled id is in range and carries real probability mass",
+              bool(((sampled >= 0) & (sampled < V)).all()) and float(p_sampled.min()) > 0,
+              f"min p(sampled)={float(p_sampled.min()):.3e}")
+    for col in (7, V - 7):
+        peaked = torch.full((4, V), -30.0, device=dev)
+        peaked[:, col] = 30.0
+        hits = sum(int((spmd(peaked, [t * 10, t * 10 + 5])[0][0][3] == col).all()) for t in range(6))
+        rep.check(f"a peaked row always draws its mode (column {col}, rank {col // width})",
+                  hits == 6, f"{hits}/6 trials")
+    flat = torch.zeros(4, V, device=dev)
+    drawn = {int(v) for t in range(12) for v in spmd(flat, [t * 7 + 1, t * 7 + 3])[0][0][3]}
+    rep.check("a uniform row does NOT collapse to one column", len(drawn) > 20,
+              f"{len(drawn)} distinct ids over 48 draws from a flat {V}-way distribution")
 
 
 if __name__ == "__main__":

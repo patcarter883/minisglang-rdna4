@@ -269,6 +269,19 @@ class SchedulerDiffusionMixin:
         self.decode_manager.filter_reqs(reqs)
 
     # ---------------------------------------------------------------------------------------
+    def _canvas_fused_tail(self) -> bool:
+        """Whether the canvas tail runs the fused native kernels (`sampler_hip.canvas_tail_*`) on RAW
+        logits. Only the vocab-SHARDED path (TP > 1) has one: at TP=1 the sampler reproduces the
+        reference `torch.multinomial` draw exactly and stays in torch. Decided once per process."""
+        v = getattr(self, "_canvas_fused", None)
+        if v is None:
+            from minisgl.diffusion.sampler import fused_canvas_tail_available
+            from minisgl.distributed import get_tp_info
+
+            v = get_tp_info().size > 1 and fused_canvas_tail_available()
+            self._canvas_fused = v
+        return v
+
     def _canvas_step(self, reqs: List[Req]) -> None:
         """One denoising step for every in-flight block, then commit whichever blocks finished.
 
@@ -363,7 +376,9 @@ class SchedulerDiffusionMixin:
         _rtx = _roctx.enabled()
         if _rtx:
             _roctx.push("canvas_fwd")
-        logits = self.engine.forward_canvas(batch, batch.input_ids, self_conditioning)
+        fused = self._canvas_fused_tail()
+        logits = self.engine.forward_canvas(batch, batch.input_ids, self_conditioning, softcap=not fused)
+        softcap = self.engine.model.canvas_softcap if fused else None
         if _rtx:
             _roctx.pop()
         tm.mark_forward()
@@ -374,7 +389,7 @@ class SchedulerDiffusionMixin:
         for i, (req, state) in enumerate(zip(reqs, states)):
             if _rtx:
                 _roctx.push("canvas_sampler")
-            out = state.step(logits[i * L : (i + 1) * L])
+            out = state.step(logits[i * L : (i + 1) * L], softcap=softcap)
             if _rtx:
                 _roctx.pop()
             tm.mark_sampler()

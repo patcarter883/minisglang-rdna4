@@ -167,7 +167,14 @@ class DiffusionGemmaForBlockDiffusion(BaseLLMModel):
         """
         return self.model.forward_canvas(input_ids, self_conditioning)
 
-    def canvas_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+    @property
+    def canvas_softcap(self) -> float | None:
+        """The final-logit softcap `canvas_logits` applies, for a caller that takes the RAW logits
+        (`softcap=False`) and applies it itself — the fused canvas tail recomputes it per element
+        instead of materialising three fp32 [rows, vocab/tp] passes of it."""
+        return self._softcap
+
+    def canvas_logits(self, hidden: torch.Tensor, softcap: bool = True) -> torch.Tensor:
         """The EAGER tail of a denoising step: fp32 softcapped logits for EVERY canvas position, over
         THIS RANK'S vocabulary columns — `[rows, vocab/tp]`, NOT `[rows, vocab]`.
 
@@ -188,7 +195,8 @@ class DiffusionGemmaForBlockDiffusion(BaseLLMModel):
         whole instead of slicing it. At tp_size == 1 the shard IS the vocabulary and every caller —
         including the parity fixtures, which compare full-vocab canvas logits against HF — sees
         exactly what it saw before."""
-        return self._softcapped(self.lm_head.logits_local_shard(hidden))
+        raw = self.lm_head.logits_local_shard(hidden)
+        return self._softcapped(raw) if softcap else raw
 
     def forward_canvas(
         self, input_ids: torch.Tensor, self_conditioning: torch.Tensor | None = None

@@ -239,6 +239,113 @@ def sharded_canvas_tail(
     return probs, entropy, argmax, sampled, noise
 
 
+def fused_canvas_tail_available() -> bool:
+    """The native canvas tail (`sampler_hip.canvas_tail_*`) is importable in this image."""
+    global _fused_ok
+    if _fused_ok is None:
+        try:
+            import sampler_hip
+
+            _fused_ok = all(hasattr(sampler_hip, n) for n in
+                            ("canvas_tail_stats", "canvas_tail_probs", "canvas_tail_invcdf"))
+        except Exception:
+            _fused_ok = False
+    return _fused_ok
+
+
+_fused_ok: Optional[bool] = None
+
+
+def fused_sharded_canvas_tail(
+    raw: torch.Tensor,
+    shard: "VocabShard",
+    vocab_size: int,
+    generator: Optional[torch.Generator],
+    softcap: Optional[float],
+    temperature: float,
+) -> tuple:
+    """`sharded_canvas_tail`, on the RAW (pre-softcap) logits, with every full-width pass fused.
+
+    Same outputs, same collectives' contents, same lockstep draw — but the [L, W] fp32 block is read
+    three times by native kernels instead of being rewritten ~20 times by torch, and `probs` comes back
+    as fp16, which is the dtype the soft embedding contracts it in anyway (it used to be cast there).
+
+      stats   per row: max + FIRST argmax of the scaled logits, and sum exp(s - max) ONLINE.
+      A       gather (row max, row sum-exp, uniform) -> global max, and the global denominator
+              sum_r S_r * exp(m_r - gmax). This folds the torch tail's separate all_reduce (B) into A,
+              so the step issues THREE small collectives, not four.
+      probs   fp16 probs, entropy partial, mass.
+      C, D    exactly as the torch tail.
+      invcdf  the per-row inverse-CDF hit, from a tiled in-order running sum.
+
+    Scaled values are bit-identical to the torch chain (see canvas_tail_kernels.hip); row SUMS are
+    not, because the reduction order differs. That can move an entropy by an ulp and so, rarely, flip
+    which token the entropy bound accepts or where the inverse-CDF lands — distributionally the same
+    draw, the standing the inverse-CDF sampler already has against torch.multinomial."""
+    import sampler_hip
+
+    global _lockstep_reported
+    raw = raw.contiguous()
+    L, W = raw.shape
+    dev = raw.device
+    cap = float(softcap) if softcap else 0.0
+    T = float(temperature)
+    part_max = torch.empty(L, device=dev, dtype=torch.float32)
+    part_idx = torch.empty(L, device=dev, dtype=torch.int64)
+    part_se = torch.empty(L, device=dev, dtype=torch.float32)
+    sampler_hip.canvas_tail_stats(raw, cap, T, part_max, part_idx, part_se)
+
+    # --- A: global max + denominator, and the deviates every rank must agree on -----------------
+    u = torch.rand(L, device=dev, dtype=torch.float32, generator=generator)
+    noise_local = torch.randint(0, vocab_size, (L,), device=dev, generator=generator)
+    ga = shard.gather(torch.stack([part_max, part_se, u]))             # [S, 3, L]
+    gmax = ga[:, 0, :].amax(dim=0)
+    denom = (ga[:, 1, :] * torch.exp(ga[:, 0, :] - gmax)).sum(dim=0)
+    u = ga[0, 2, :]
+    lse = gmax + torch.log(denom)
+
+    probs = torch.empty(L, W, device=dev, dtype=torch.float16)
+    ent_part = torch.empty(L, device=dev, dtype=torch.float32)
+    mass = torch.empty(L, device=dev, dtype=torch.float32)
+    sampler_hip.canvas_tail_probs(raw, cap, T, gmax, denom, lse, probs, ent_part, mass)
+
+    # --- C: entropy, the argmax candidates, and each rank's probability mass ----------------------
+    gc = shard.gather(torch.stack([ent_part, part_max, mass]))          # [S, 3, L]
+    entropy = gc[:, 0, :].sum(dim=0)
+    vals, masses = gc[:, 1, :], gc[:, 2, :]
+
+    # --- D: the inverse-CDF hit, the global argmax index, the lockstep renoise ---------------------
+    offsets = (torch.cumsum(masses, dim=0) - masses)[shard.rank]
+    target = (u * masses.sum(dim=0) - offsets).contiguous()
+    pos = torch.empty(L, device=dev, dtype=torch.int64)
+    sampler_hip.canvas_tail_invcdf(raw, cap, T, gmax, denom, target, pos)
+    pos = pos.clamp_(max=W - 1) + shard.start
+    owned = (target >= 0) & (target < masses[shard.rank])
+    gd = shard.gather(torch.stack([
+        part_idx + shard.start,
+        noise_local,
+        torch.where(owned, pos, torch.full_like(pos, -1)),
+    ]))                                                                  # [S, 3, L]
+    idxs, noise, hits = gd[:, 0, :], gd[0, 1, :], gd[:, 2, :]
+    best = vals.amax(dim=0, keepdim=True)
+    argmax = torch.where(vals == best, idxs, torch.full_like(idxs, _INT64_MAX)).amin(dim=0)
+    sampled = hits.amax(dim=0)
+    sampled = torch.where(sampled < 0, argmax, sampled)
+
+    if not _lockstep_reported and shard.size > 1:
+        _lockstep_reported = True
+        from minisgl.utils import init_logger
+
+        agreed = bool(torch.equal(noise, noise_local)) and bool(torch.equal(u, ga[shard.rank, 2, :]))
+        init_logger(__name__).info(
+            f"[canvas] TP rank {shard.rank}: RNG deviates "
+            f"{'AGREED with' if agreed else 'DIVERGED from'} rank 0 on the first sharded step "
+            f"(rank 0's are used either way — the draw is lockstep by construction, not by luck); "
+            f"fused native tail engaged"
+        )
+    return probs, entropy, argmax, sampled, noise
+
+
 @dataclass(frozen=True)
 class DiffusionSamplerConfig:
     """The knobs, all off `generation_config.json` — never a model-name branch."""
@@ -367,8 +474,14 @@ class CanvasState:
             generator=self.generator,
         )
 
-    def step(self, logits: torch.Tensor) -> DiffusionStep:
+    def step(self, logits: torch.Tensor, softcap: Optional[float] = None) -> DiffusionStep:
         """Consume this step's RAW (softcapped, fp32) logits and advance the state.
+
+        `softcap` given means `logits` are the LM head's output BEFORE the final-logit softcap, and
+        the cap is this step's to apply: the vocab-sharded path hands both to the fused native tail
+        (`fused_sharded_canvas_tail`), which recomputes `tanh(x/cap)*cap/T` per element instead of
+        materialising it; any other path applies the cap here in torch, exactly as the model's
+        `_softcapped` does, and continues unchanged.
 
         `logits` is [canvas_length, V] for THIS request only — the temperature is a function of the
         request's own step index, so a batch cannot share one scale (see the per-request temperature
@@ -382,10 +495,20 @@ class CanvasState:
         it raises."""
         cfg = self.config
         assert not self.finished, "a finished canvas must not be stepped again"
-        scaled = logits / cfg.temperature(self.step_index)
-        width = scaled.shape[-1]
+        width = logits.shape[-1]
+        fused = softcap is not None and width != cfg.vocab_size and fused_canvas_tail_available()
+        if softcap is not None and not fused:
+            logits = torch.tanh(logits.float() / softcap) * softcap
+        scaled = None if fused else logits / cfg.temperature(self.step_index)
 
-        if width != cfg.vocab_size:
+        if fused:
+            if self._shard is None:
+                self._shard = _shard_for(width, cfg.vocab_size)
+            probs, entropy, argmax, sampled, fresh = fused_sharded_canvas_tail(
+                logits, self._shard, cfg.vocab_size, self.generator,
+                softcap, cfg.temperature(self.step_index),
+            )
+        elif width != cfg.vocab_size:
             # --- the VOCAB-PARALLEL tail ----------------------------------------------------------
             # Same quantities, same order, reduced across the TP group instead of over a tensor that
             # had to be all_gathered first. See `sharded_canvas_tail` for the four messages and for
