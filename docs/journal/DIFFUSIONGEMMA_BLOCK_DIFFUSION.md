@@ -2335,3 +2335,70 @@ prefill-shaped, but the decode-oriented defaults under-tile it … ~2x faster"*.
 is built `phase="decode"` at M=256, and §D10.7 already reports the dense path picking a tile that
 launches 64 workgroups on 64 CUs at 12/16 waves. Whether the dispatch keys off phase rather than
 actual M is the open question, and it is a measurement, not an argument.
+
+---
+
+## Part D14 — 2026-09-25: it no longer booted, it had regressed 51%, and then 148.6 -> 76.7 ms/step
+
+All numbers: `tools/canvas_step_time.sh` (differenced 10-step windows, TP=2, bs=1, `MINISGL_SWA_RADIX=0`),
+graph gate `0.000e+00` on every arm. Fixtures: `/home/pat/fixtures/minisgl-dgopt-20260925/`.
+
+### D14.1 Two breakages found before any optimisation
+
+* **It did not boot.** transformers 5.17 (in the serve image) marks per-layer-overridden attributes
+  (`head_dim`, `num_key_value_heads` on the five full layers) and RAISES on a global read, and it
+  DROPS `global_head_dim` / `num_global_key_value_heads` in favour of those overrides. Opting into
+  global reads alone would have built the full layers at the sliding geometry (256/8, not 512/2).
+  Fixed in `cached_load_hf_config` + `ModelConfig._full_layer_override` (8ca22e35).
+* **It had regressed 98.4 -> 148.6 ms/step** — the 08-06 engine re-run on today's box gave 98.4, so the
+  box was fine. The trace put 51.5 ms of a 184 ms traced step on one fp32 rocBLAS GEMM (`MT16x16x16`,
+  16 dispatches/step): the fp32-logits store (the 0.125-grid fix) sent every LM-head call over 16 rows
+  to a fallback that cast each 8192-row weight chunk to fp32 — documented as "rare, once per request".
+  The canvas scores 256 rows every step. `torch.mm(..., out_dtype=float32)` keeps the fp32 accumulate
+  and store with no cast: 53.5 -> 1.71 ms/call (757fcad1). 148.6 -> **90.2 ms**.
+
+### D14.2 What moved the step (each arm measured on its own boot)
+
+| change | step (ms) | where |
+|---|---|---|
+| baseline, today (boots with D14.1's config fix) | 148.6 | |
+| LM-head fallback: one half GEMM with fp32 out | 90.2 | engine 757fcad1 |
+| dense W4A8, group 32: 4 groups per barrier (bit-identical) | 87.8 | kernels 0a56376 |
+| W4A8 MoE `block_m` rule (canvas 16 -> 32) | 81.4 | engine 8107f884 |
+| fused native canvas tail (sampler 4.8 -> ~1.4 ms) | **76.7** | kernels 99b1405 + engine bded6711 |
+
+`MINISGL_ATTN_MAX_SPLITS=1` no longer buys anything (148.6 vs 148.7): the 09-24 per-tile slab split
+policy made split-K free at the canvas shape, which closes D12.4's standing 10%.
+
+### D14.3 Findings that outlive the canvas
+
+* **Dense W4A8 at group 32 was a chain of serial memory latencies.** One group (two WMMA k-steps) per
+  `__syncthreads` pair: `k_proj` (N=512) and `q_proj` (N=2048) both cost ~87-98 us at M=256. Staging
+  four groups per barrier, chosen jointly with the tile by the existing cost model at span 128, is
+  1.11-1.40x on the canvas projections, 1.50-2.34x at M=17, bit-identical in every cell (int4 and
+  MXFP4). Two M=1024 `o_proj` cells lose 8-9% where the model moves to a 256x96 tile it misprices.
+* **The W4A8 MoE `block_m` rule was wrong for 15 of 18 measured cells.** For silu/group-capable
+  experts, `block_m=64` engages the register-tiled `gemm1_silu_flag`: Qwen3.6-35B M=64..512 2.2-3.0x
+  per MoE layer; 35B cold-prefill TTFT -27..-44% (277->174, 426->237, 624->454, 1186->851 ms), with the
+  DFlash CONC=4 verify graphs capturing at the same free memory. The shared analytic chooser picks the
+  measured block_m in 3 of the 18 cells, so it does not decide this.
+* **Side-stream collectives DO capture** (event fork/join, gate stays 0.000e+00) — `tp_overlap`'s
+  "cannot be recorded" was wrong — but the captured step got SLOWER, 87.8 -> 99.3 ms: the spinning
+  one-shot all-reduce competes with the grouped GEMM for CUs. Left inline, docstring corrected.
+* **Not host-bound, re-confirmed.** py-spy in steady state: 82% of the canvas thread is in
+  `synchronize()` waiting on the GPU. The trace's multi-ms inter-phase gaps are the profiler's cost on
+  eager launches.
+
+### D14.4 Measured and dropped
+
+* Dense **W4A16** instead of W4A8 at the canvas shapes: 1.4-3.0x SLOWER.
+* MoE **GTILE sized in K** (16 groups at g=32): ~2x slower (LDS per block kills occupancy).
+* MoE **A-operand / group-scale prefetch** in the ashuffle core: within +-3% of the control.
+* **hipBLASLt** for the LM head / soft embedding: identical to rocBLAS (1.73 / 2.53 ms).
+
+### D14.5 Where the 76.7 ms is now (card-1 trace, shares only)
+
+MoE grouped GEMM ~38% (at ~35-39% of HBM whatever the tile — the core's limit needs counters, not
+guesses), one-shot all-reduce ~20% (1.44 MB over card 1's Gen4 x8 link, ~99 us of the ~130 us is the
+link), dense W4A8 ~14%, soft-embed GEMM (2.7 ms, rocBLAS at ~287 GB/s against the 738 MB shard) and
+LM head (1.7 ms), then norms/elementwise, attention ~3.6%.
