@@ -169,6 +169,8 @@ class EPCommunicator:
             # what keeps the double-buffer slot counter and the fallback decision in sync across the two
             # SEPARATE replica processes (mismatched branches would deadlock: one waits on a peer flag the
             # other never bumps). Oversized (eager long prefill) or non-contiguous -> RCCL on BOTH ranks.
+            if car.push is not None and car.push.run_if_eligible(x):
+                return x
             if x.is_contiguous() and n * x.element_size() <= car.slot_bytes:
                 slot = car.ctr & 1
                 car.ctr += 1
@@ -177,6 +179,48 @@ class EPCommunicator:
                 return x
         dist.all_reduce(x, op=dist.ReduceOp.SUM, group=self.group)
         return x
+
+
+# The PUSH one-shot all-reduce (custom_ar.one_shot_ar_push) for the small collectives. MEASURED
+# (custom_ar/tests/test_push_ar.py, 200 calls captured in a graph, the two cards of this box): 5.5 KiB
+# — the bs=1 decode residual — 10.6 us vs the pull kernel's 17.3; 88 KiB 14.9 vs 17.6; but 1.4 MiB
+# 157 vs 148, where the pull kernel's parallel peer reads win. So: push up to this size, pull above.
+# Both ranks take the same branch because it depends only on the message size.
+PUSH_MAX_BYTES = 128 << 10
+
+
+@dataclass
+class _PushAR:
+    """Push all-reduce state: this rank's two-slot uncached scratch and the flag words the PEER writes,
+    the peer's pointers to both, and a local device-resident per-block sequence counter (the kernel
+    advances it, so graph replay stays in step). Separate from the pull buffers and flags: the two
+    protocols give their flag words different meanings and must never share one."""
+
+    scratch: "torch.Tensor"
+    flags: "torch.Tensor"
+    peer_scratch: int
+    peer_flags: int
+    seq: "torch.Tensor"
+    ops: "object"
+
+    def run_if_eligible(self, x: torch.Tensor) -> bool:
+        nb = x.numel() * x.element_size()
+        if not x.is_contiguous() or nb % 16 != 0 or nb > PUSH_MAX_BYTES:
+            return False
+        self.ops.one_shot_ar_push(x, x, self.scratch, self.peer_scratch, self.flags, self.peer_flags,
+                                  self.seq, PUSH_MAX_BYTES)
+        return True
+
+
+def _make_push_ar(car, exchange) -> "_PushAR | None":
+    """Allocate + exchange the push buffers, or None on an image whose custom_ar predates the op (the
+    pull kernel then serves every size, as before)."""
+    if not hasattr(car, "one_shot_ar_push"):
+        return None
+    scratch = car.alloc_shared(2 * PUSH_MAX_BYTES, 0)
+    flags = car.alloc_shared(64 * 4, 3)
+    return _PushAR(scratch=scratch, flags=flags, peer_scratch=exchange(scratch), peer_flags=exchange(flags),
+                   seq=torch.zeros(64, dtype=torch.int32, device=torch.cuda.current_device()), ops=car)
 
 
 @dataclass
@@ -206,6 +250,7 @@ class _EPCustomAR:
     ag_peer_flags_ptr: int = 0
     ag_slot_bytes: int = 0
     ag_ctr: int = 0
+    push: "_PushAR | None" = None
 
 
 def enable_custom_ar_ep(
@@ -258,6 +303,7 @@ def enable_custom_ar_ep(
         peer_data_base = _exchange(self_data)
         peer_flags_ptr = _exchange(self_flags)
         peer_data_ptr = [peer_data_base, peer_data_base + slot_bytes]
+        push = _make_push_ar(car, _exchange) if enable_ar else None
 
         ag_data = ag_flags = ag_peer_data_ptr = None
         ag_peer_flags_ptr = 0
@@ -280,7 +326,7 @@ def enable_custom_ar_ep(
         self_data=self_data, self_flags=self_flags, peer_data_ptr=peer_data_ptr,
         peer_flags_ptr=peer_flags_ptr, slot_bytes=slot_bytes, ops=car, enable_ar=enable_ar,
         ag_data=ag_data, ag_flags=ag_flags, ag_peer_data_ptr=ag_peer_data_ptr,
-        ag_peer_flags_ptr=ag_peer_flags_ptr, ag_slot_bytes=ag_slot_bytes,
+        ag_peer_flags_ptr=ag_peer_flags_ptr, ag_slot_bytes=ag_slot_bytes, push=push,
     )
     from minisgl.utils import init_logger
     parts = []
@@ -328,10 +374,13 @@ class CustomARDistributedImpl(DistributedImpl):
     ag_peer_flags_ptr: int = 0
     ag_slot_bytes: int = 0
     _ag_ctr: int = 0
+    push: "_PushAR | None" = None
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         from .info import get_tp_info
         if get_tp_info().size == 1:
+            return x
+        if self.push is not None and self.push.run_if_eligible(x):
             return x
         n = x.numel()
         nb = n * x.element_size()
@@ -434,6 +483,7 @@ def enable_custom_ar_distributed(
         peer_data_base = _exchange(self_data)
         peer_flags_ptr = _exchange(self_flags)
         peer_data_ptr = [peer_data_base, peer_data_base + slot_bytes]
+        push = _make_push_ar(car, _exchange)
 
         # The all_gather's OWN double-buffered publish buffer (see the field comments). Allocated only
         # when the kernel exists and a size was asked for; every other case leaves the gather on RCCL.
@@ -458,7 +508,7 @@ def enable_custom_ar_distributed(
             self_data=self_data, self_flags=self_flags, peer_data_ptr=peer_data_ptr,
             peer_flags_ptr=peer_flags_ptr, slot_bytes=slot_bytes, _ops=car,
             ag_data=ag_data, ag_flags=ag_flags, ag_peer_data_ptr=ag_peer_data_ptr,
-            ag_peer_flags_ptr=ag_peer_flags_ptr, ag_slot_bytes=ag_slot_bytes,
+            ag_peer_flags_ptr=ag_peer_flags_ptr, ag_slot_bytes=ag_slot_bytes, push=push,
         )
     )
     from minisgl.utils import init_logger
@@ -472,7 +522,8 @@ def enable_custom_ar_distributed(
                                        else "image custom_ar predates all_gather_p2p") + ")")
     init_logger(__name__).info_rank0(
         f"custom_ar one-shot all-reduce ENABLED (graph-safe, ~1.15-1.2x vs RCCL at every size; "
-        f"slot {slot_bytes / (1 << 20):.1f} MiB -> covers up to {slot_bytes} B/collective) {_ag}"
+        f"slot {slot_bytes / (1 << 20):.1f} MiB -> covers up to {slot_bytes} B/collective; "
+        f"{'PUSH' if push is not None else 'pull'} kernel up to {PUSH_MAX_BYTES} B) {_ag}"
     )
 
 
