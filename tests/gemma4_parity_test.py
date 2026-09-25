@@ -463,7 +463,9 @@ def check_layer(rep: Report, mc, tc, handles) -> None:
     )
 
     attn_w = torch.randn(mc.hidden_size, mc.hidden_size) * 0.02
-    mine.self_attn = types.SimpleNamespace(forward=lambda h: h @ attn_w.T)
+    # The layer hands attention the input norm's fp8 form too (x_fp8, act_scales); the stub is the
+    # unquantized reference path, so it takes and ignores them.
+    mine.self_attn = types.SimpleNamespace(forward=lambda h, x_fp8=None, act_scales=None: h @ attn_w.T)
     ref.self_attn = _stub_module(lambda **kw: (kw["hidden_states"] @ attn_w.T, None))
     # minisgl calls experts(hidden, topk_weights, topk_ids); the reference calls it
     # (hidden, top_k_index, top_k_weights) — the adapter is the ONLY difference allowed.
@@ -545,31 +547,31 @@ def check_attention(rep: Report, mc, tc, handles) -> None:
         deq = lambda m: dequant_ct_int4(_get(handles, f"{p}.{m}.weight_packed"),
                                         _get(handles, f"{p}.{m}.weight_scale"))
         mine = Gemma4Attention(cfgu, layer_id)
-        mine.q_proj.weight = deq("q_proj")
-        mine.k_proj.weight = deq("k_proj")
-        if mine.v_proj is not None:
-            mine.v_proj.weight = deq("v_proj")
+        # ONE merged q|k(|v) projection, stacked exactly as the loader does (`_gemma4_qkv_merge`).
+        wq, wk = deq("q_proj"), deq("k_proj")
+        wv = deq("v_proj") if mine._has_v else None
+        mine.qkv_proj.weight = torch.cat([w for w in (wq, wk, wv) if w is not None], dim=0)
         mine.o_proj.weight = deq("o_proj")
         mine.q_norm.weight = _get(handles, f"{p}.q_norm.weight").float()
         mine.k_norm.weight = _get(handles, f"{p}.k_norm.weight").float()
 
         ref = ref_mod.Gemma4TextAttention(tc, layer_id).float()
         with torch.no_grad():
-            ref.q_proj.weight.copy_(mine.q_proj.weight)
-            ref.k_proj.weight.copy_(mine.k_proj.weight)
+            ref.q_proj.weight.copy_(wq)
+            ref.k_proj.weight.copy_(wk)
             if ref.v_proj is not None:
-                ref.v_proj.weight.copy_(mine.v_proj.weight)
+                ref.v_proj.weight.copy_(wv)
             ref.o_proj.weight.copy_(mine.o_proj.weight)
             ref.q_norm.weight.copy_(mine.q_norm.weight)
             ref.k_norm.weight.copy_(mine.k_norm.weight)
 
         rep.check(
             f"L{layer_id} {kind}: geometry + v_proj presence",
-            (mine.v_proj is not None) == (ref.v_proj is not None)
+            mine._has_v == (ref.v_proj is not None)
             and mine._head_dim == ref.head_dim
             and mine._nkv_local == tc.num_attention_heads // ref.num_key_value_groups,
             f"head_dim={mine._head_dim} kv_heads={mine._nkv_local} "
-            f"v_proj={'present' if mine.v_proj is not None else 'ABSENT'} "
+            f"v_proj={'present' if mine._has_v else 'ABSENT'} "
             f"(reference use_alternative_attention={ref.use_alternative_attention}) "
             f"ref.scaling={ref.scaling}",
         )
@@ -602,7 +604,7 @@ def check_attention(rep: Report, mc, tc, handles) -> None:
 
         # V must NOT equal the cached (k_norm'd + RoPE'd) key, and must not be the raw k_proj output.
         raw_k = torch.nn.functional.linear(
-            x, mine.v_proj.weight if mine.v_proj is not None else mine.k_proj.weight)
+            x, wv if wv is not None else wk)
         raw_k = raw_k.view(n_tok, -1, mine._head_dim)
         d_key = (mv - mk).abs().max().item()
         d_raw = (mv - raw_k).abs().max().item()
@@ -740,15 +742,14 @@ def main() -> int:
 
     set_tp_info(0, 1)
     import minisgl.layers.rotary as rotary_mod
-    from transformers import AutoConfig
-
+    from minisgl.utils.hf import load_pretrained_config  # AutoConfig + the 5.17 per-layer opt-in
     from minisgl.models.config import ModelConfig
 
     rotary_mod.set_rope_device(torch.device("cpu"))
     torch.set_default_dtype(torch.float32)
     torch.set_grad_enabled(False)
 
-    hf = AutoConfig.from_pretrained(path)
+    hf = load_pretrained_config(path)
     mc = ModelConfig.from_hf(hf, spec_algorithm="none")
     tc = hf.text_config
     handles = _open(path)

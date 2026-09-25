@@ -262,24 +262,32 @@ def check_soft_embedding(rep: Report, mc, handles) -> None:
 def synthetic_config(path: str):
     """A small DiffusionGemmaConfig with the real one's SHAPE.
 
-    `per_layer_config` is set to None deliberately. In transformers 5.14.1 (the shipped version) it
-    is already None on the real config and both attention classes read `config.global_head_dim` /
-    `config.head_dim` directly; populating it instead marks the config HETEROGENEOUS and every
-    `config.head_dim` read then raises AmbiguousGlobalPerLayerAttributeError. (The port's own spec
-    doc describes the opposite gotcha, from an older reference copy — see the note in the summary.)
+    The text config is CONSTRUCTED from the synthetic values rather than patched onto a copy of the
+    real one. Under transformers 5.17 the full-layer geometry lives in per-layer overrides that the
+    config's __init__ derives from `global_head_dim` / `num_global_key_value_heads` (the real
+    checkpoint carries {5, 11, 17, 23, 29: head_dim 512, 2 kv heads}); setattr-ing those fields onto
+    an existing object does NOT re-derive them. The earlier version set `per_layer_config = None`
+    (right for 5.14.1, which read `global_head_dim` directly) — on 5.17 that silently built the
+    reference's full layer at the SLIDING head_dim, so the oracle itself was mis-shaped.
     """
-    from transformers import AutoConfig
+    from minisgl.utils.hf import _allow_global_per_layer_reads, load_pretrained_config
 
-    cfg = copy.deepcopy(AutoConfig.from_pretrained(path))
-    tc = cfg.text_config
-    tc.per_layer_config = None
-    for key, value in SYN.items():
-        setattr(tc, key, value)
-    tc.layer_types = ["sliding_attention"] * (SYN["num_hidden_layers"] - 1) + ["full_attention"]
+    cfg = copy.deepcopy(load_pretrained_config(path))
+    d = cfg.text_config.to_dict()
+    d.pop("per_layer_config", None)
+    d.update(SYN)
+    d["layer_types"] = ["sliding_attention"] * (SYN["num_hidden_layers"] - 1) + ["full_attention"]
+    d.pop("quantization_config", None)  # the synthetic stack is dense fp32
+    cfg.text_config = type(cfg.text_config)(**d)
+    spec = cfg.text_config.__dict__.get("_heterogeneity_spec")
+    assert spec is not None and spec.per_layer_overrides == {
+        SYN["num_hidden_layers"] - 1: {"head_dim": SYN["global_head_dim"],
+                                       "num_key_value_heads": SYN["num_global_key_value_heads"]}
+    }, f"synthetic full-layer geometry not derived: {spec}"
     cfg.canvas_length = CANVAS
-    for c in (cfg, tc):
-        if hasattr(c, "quantization_config"):
-            delattr(c, "quantization_config")  # the synthetic stack is dense fp32
+    if hasattr(cfg, "quantization_config"):
+        delattr(cfg, "quantization_config")
+    _allow_global_per_layer_reads(cfg)
     return cfg
 
 
@@ -354,22 +362,34 @@ def _build_minisgl(mc, hf_model):
     ]:
         gate, up = sd.pop(f"{prefix}.gate_proj.weight"), sd.pop(f"{prefix}.up_proj.weight")
         sd[f"{prefix}.gate_up_proj.weight"] = torch.cat([gate, up], dim=0)
+    # q/k(/v) are ONE merged projection, stacked as the loader's `_gemma4_qkv_merge` does; a full
+    # layer ships no v_proj, so its merge is [q | k].
+    for i in range(mc.num_layers):
+        p = f"model.layers.{i}.self_attn"
+        parts = [sd.pop(f"{p}.{m}_proj.weight") for m in "qkv" if f"{p}.{m}_proj.weight" in sd]
+        sd[f"{p}.qkv_proj.weight"] = torch.cat(parts, dim=0)
     model.load_state_dict(sd)  # raises on ANY leftover or missing key
     return model, layer_of
 
 
 def _run_minisgl(model, fn, positions, backend):
     import minisgl.layers.attention as attn_mod
+    import minisgl.models.gemma4 as g4_mod
 
+    # Every module that reads the global context on this path: the attention layer (positions,
+    # backend) and the Gemma-4 model forward (the image-merge hook — no image here, mm_merge=None).
     ctx = types.SimpleNamespace(
-        batch=types.SimpleNamespace(positions=positions), attn_backend=backend
+        batch=types.SimpleNamespace(positions=positions, mm_merge=None), attn_backend=backend
     )
-    saved = attn_mod.get_global_ctx
-    attn_mod.get_global_ctx = lambda: ctx
+    mods = (attn_mod, g4_mod)
+    saved = [m.get_global_ctx for m in mods]
+    for m in mods:
+        m.get_global_ctx = lambda: ctx
     try:
         return fn()
     finally:
-        attn_mod.get_global_ctx = saved
+        for m, g in zip(mods, saved):
+            m.get_global_ctx = g
 
 
 def check_full_stack(rep: Report, path: str) -> None:
@@ -399,8 +419,9 @@ def check_full_stack(rep: Report, path: str) -> None:
         layer.layer_scalar.copy_(hf.model.decoder.layers[i].layer_scalar)
     hf.eval()
 
+    # Text-only: the synthetic stack ships no vision tower weights (the tower has its own tests).
     mc = dataclasses.replace(
-        ModelConfig.from_hf(cfg, spec_algorithm="none"), quant=None
+        ModelConfig.from_hf(cfg, spec_algorithm="none"), quant=None, vision=None
     )
     print(
         f"\n[3] full stack, CANVAS role — synthetic {mc.num_layers}-layer "
@@ -555,15 +576,14 @@ def main() -> int:
 
     set_tp_info(0, 1)
     import minisgl.layers.rotary as rotary_mod
-    from transformers import AutoConfig
-
+    from minisgl.utils.hf import load_pretrained_config  # AutoConfig + the 5.17 per-layer opt-in
     from minisgl.models.config import ModelConfig
 
     rotary_mod.set_rope_device(torch.device("cpu"))
     torch.set_default_dtype(torch.float32)
     torch.set_grad_enabled(False)
 
-    hf = AutoConfig.from_pretrained(path)
+    hf = load_pretrained_config(path)
     mc = ModelConfig.from_hf(hf, spec_algorithm="none")
     handles = _open(path)
 

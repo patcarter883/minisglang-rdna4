@@ -284,6 +284,18 @@ def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     return fresh
 
 
+def load_pretrained_config(model_path: str) -> PretrainedConfig:
+    """`AutoConfig.from_pretrained` — the REAL config class, which a transformers reference model
+    needs — with the same global-per-layer opt-in as `cached_load_hf_config`. Tests and tools that
+    build a ModelConfig or a HF reference from a checkpoint use this; a bare AutoConfig raises on
+    Gemma-4 / DiffusionGemma under transformers 5.17."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_path)
+    _allow_global_per_layer_reads(config)
+    return config
+
+
 def _allow_global_per_layer_reads(config: PretrainedConfig) -> None:
     """Opt the loaded config (and every nested sub-config) into reading per-layer attributes at
     their GLOBAL value.

@@ -127,13 +127,12 @@ def main() -> int:
         return 0
     path = matches[0]
 
-    from transformers import AutoConfig
-
+    from minisgl.utils.hf import load_pretrained_config  # AutoConfig + the 5.17 per-layer opt-in
     from minisgl.models.config import ModelConfig
 
     torch.set_default_dtype(torch.float32)
     torch.set_grad_enabled(False)
-    hf_cfg = AutoConfig.from_pretrained(path)
+    hf_cfg = load_pretrained_config(path)
     mc = ModelConfig.from_hf(hf_cfg, spec_algorithm="none")
     handles = _open(path)
 

@@ -24,8 +24,7 @@ import glob
 import sys
 
 import torch
-from transformers import AutoConfig
-
+from minisgl.utils.hf import load_pretrained_config  # AutoConfig + the 5.17 per-layer opt-in
 from minisgl.layers import rotary as rotary_mod
 from minisgl.layers.rotary import get_rope
 from minisgl.models.config import ModelConfig
@@ -69,7 +68,7 @@ def main() -> int:
         print(f"SKIP: checkpoint not cached under {MODEL_GLOB}")
         return 0
     path = matches[0]
-    hf = AutoConfig.from_pretrained(path)
+    hf = load_pretrained_config(path)
     mc = ModelConfig.from_hf(hf, spec_algorithm="none")
 
     failures = 0

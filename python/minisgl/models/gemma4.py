@@ -41,6 +41,7 @@ from minisgl.layers import (
     BaseOP,
     LinearColParallelMerged,
     LinearOProj,
+    LinearQKVMerged,
     LinearRowParallel,
     MoELayer,
     OPList,
@@ -124,22 +125,21 @@ class Gemma4Attention(BaseOP):
                 q, quantized=q is not None and q.is_module_quantized(name)
             )
 
-        self.q_proj = LinearColParallelMerged(
-            config.hidden_size, [nqo * head_dim], has_bias=False, quant_method=_method("q_proj")
+        # q, k (and v on the sliding layers) in ONE merged projection: the checkpoint ships them
+        # apart, the loader stacks each rank's shards (weight.py `_gemma4_qkv_merge`). One decode
+        # GEMV instead of three — the three shared the same input row, so apart they paid three
+        # launches and three passes of fixed per-call cost for one input read's worth of work.
+        # A full layer ships NO v_proj (`attention_k_eq_v`): its merge is [q | k], and building a v
+        # slice would fail the loader's exact-key check — the absence IS the architecture signal.
+        quantized = {m: q is not None and q.is_module_quantized(f"{prefix}.{m}")
+                     for m in (("q_proj", "k_proj", "v_proj") if plan.has_v_proj else ("q_proj", "k_proj"))}
+        if len(set(quantized.values())) != 1:
+            raise ValueError(f"{prefix}: q/k/v quantization differs {quantized}; cannot merge them")
+        self.qkv_proj = LinearQKVMerged(
+            config.hidden_size, head_dim, nqo, nkv, has_bias=False,
+            quant_method=_method("q_proj"), has_v=plan.has_v_proj,
         )
-        self.k_proj = LinearColParallelMerged(
-            config.hidden_size, [nkv * head_dim], has_bias=False, quant_method=_method("k_proj")
-        )
-        # Building a v_proj the checkpoint does not ship would fail the loader's exact-key check,
-        # which is the intended behaviour: the absence of the tensor IS the architecture signal.
-        self.v_proj = (
-            LinearColParallelMerged(
-                config.hidden_size, [nkv * head_dim], has_bias=False,
-                quant_method=_method("v_proj"),
-            )
-            if plan.has_v_proj
-            else None
-        )
+        self._has_v = plan.has_v_proj
         self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
         # `with_scale=False` in the reference: no weight tensor exists in the checkpoint, and V is
@@ -176,13 +176,16 @@ class Gemma4Attention(BaseOP):
         the pair each one re-reads (M, K) and launches its own `compute_act_fp8_and_scales_kernel` —
         the same activation quantized three times per layer. Bit-identical when it fires; `None` (an
         unquantized checkpoint, or a tail_hip predating the op) just restores exactly that."""
-        q = self.q_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
-        k = self.k_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
+        qkv = self.qkv_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
+        q_dim, kv_dim = self.attn.qo_attn_dim, self.attn.kv_attn_dim
         # On a full layer V reuses k_proj's OUTPUT, not the cached key: the key that reaches the KV
         # pool has since been k_norm'd (a learned gain) and RoPE'd, neither of which V gets. Reading
         # it back off the key would silently rotate the values.
-        v_src = (self.v_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
-                 if self.v_proj is not None else k)
+        if self._has_v:
+            q, k, v_src = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+        else:
+            q, k = qkv.split([q_dim, kv_dim], dim=-1)
+            v_src = k
         # AttentionLayer runs q/k_norm + RoPE and this layer's scale-less v_norm (one fused launch
         # when tail_hip.qk_norm_rope applies). v_src may BE k's projection output; it is read before
         # anything is written.

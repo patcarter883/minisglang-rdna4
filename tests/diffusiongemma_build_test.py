@@ -69,8 +69,7 @@ def main() -> int:
     set_tp_info(0, tp_size)
 
     import minisgl.layers.rotary as rotary_mod
-    from transformers import AutoConfig
-
+    from minisgl.utils.hf import load_pretrained_config  # AutoConfig + the 5.17 per-layer opt-in
     from minisgl.models import create_model, load_weight
     from minisgl.models.config import ModelConfig
     from minisgl.models.weight import checkpoint_tensor_names
@@ -79,7 +78,7 @@ def main() -> int:
     torch.set_default_dtype(torch.float16)
     torch.set_grad_enabled(False)
 
-    hf = AutoConfig.from_pretrained(path)
+    hf = load_pretrained_config(path)
     names = checkpoint_tensor_names(MODEL_ID)
     mc = ModelConfig.from_hf(hf, spec_algorithm="none", ckpt_tensor_names=names)
 
@@ -110,7 +109,7 @@ def main() -> int:
         print(f"  SKIP: {AR_MODEL_ID} not cached, cannot difference the two parameter sets")
     else:
         ar_mc = ModelConfig.from_hf(
-            AutoConfig.from_pretrained(ar_path),
+            load_pretrained_config(ar_path),
             spec_algorithm="none",
             ckpt_tensor_names=checkpoint_tensor_names(AR_MODEL_ID),
         )

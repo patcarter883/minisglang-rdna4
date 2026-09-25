@@ -34,8 +34,7 @@ def main() -> int:
     set_tp_info(0, tp_size)
 
     import minisgl.layers.rotary as rotary_mod
-    from transformers import AutoConfig
-
+    from minisgl.utils.hf import load_pretrained_config  # AutoConfig + the 5.17 per-layer opt-in
     from minisgl.models import create_model, load_weight
     from minisgl.models.config import ModelConfig
 
@@ -46,7 +45,7 @@ def main() -> int:
         print(f"SKIP: checkpoint not cached under {MODEL_GLOB}")
         return 0
 
-    mc = ModelConfig.from_hf(AutoConfig.from_pretrained(matches[0]), spec_algorithm="none")
+    mc = ModelConfig.from_hf(load_pretrained_config(matches[0]), spec_algorithm="none")
     torch.set_default_dtype(torch.float16)
     with torch.device("meta"):
         model = create_model(mc)

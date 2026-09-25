@@ -56,8 +56,7 @@ def main() -> int:
     from minisgl.distributed import set_tp_info
 
     set_tp_info(0, 1)
-    from transformers import AutoConfig
-
+    from minisgl.utils.hf import load_pretrained_config  # AutoConfig + the 5.17 per-layer opt-in
     from minisgl.attention.rdna4 import RDNA4Backend
     from minisgl.engine.engine import _swa_ring_block
     from minisgl.models.config import ModelConfig
@@ -68,7 +67,7 @@ def main() -> int:
     if path is None:
         print(f"SKIP: {MODEL_ID} not cached")
         return 0
-    mc = ModelConfig.from_hf(AutoConfig.from_pretrained(path), spec_algorithm="none")
+    mc = ModelConfig.from_hf(load_pretrained_config(path), spec_algorithm="none")
 
     print(f"[canvas-meta] canvas_length={mc.canvas_length} window={mc.sliding_window} "
           f"is_block_diffusion={mc.is_block_diffusion}")
@@ -84,7 +83,7 @@ def main() -> int:
     if ar_path is None:
         print(f"  SKIP: {AR_MODEL_ID} not cached, cannot check the negative case")
     else:
-        ar_mc = ModelConfig.from_hf(AutoConfig.from_pretrained(ar_path), spec_algorithm="none")
+        ar_mc = ModelConfig.from_hf(load_pretrained_config(ar_path), spec_algorithm="none")
         rep.check(
             "the autoregressive sibling is NOT",
             not ar_mc.is_block_diffusion and ar_mc.canvas_length is None,

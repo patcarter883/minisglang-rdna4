@@ -40,8 +40,7 @@ def main() -> int:
     set_tp_info(0, tp_size)
 
     import minisgl.layers.rotary as rotary_mod
-    from transformers import AutoConfig
-
+    from minisgl.utils.hf import load_pretrained_config  # AutoConfig + the 5.17 per-layer opt-in
     from minisgl.models import create_model
     from minisgl.models.config import ModelConfig
 
@@ -51,7 +50,7 @@ def main() -> int:
     if not matches:
         print(f"SKIP: checkpoint not cached under {MODEL_GLOB}")
         return 0
-    mc = ModelConfig.from_hf(AutoConfig.from_pretrained(matches[0]), spec_algorithm="none")
+    mc = ModelConfig.from_hf(load_pretrained_config(matches[0]), spec_algorithm="none")
 
     torch.set_default_dtype(torch.float16)
     with torch.device("meta"):
@@ -91,17 +90,16 @@ def main() -> int:
     ):
         p = f"model.layers.{layer_id}.self_attn"
         kv_local = max(n_kv // tp_size, 1)  # replicated rather than split when nkv < tp_size
-        check(f"L{layer_id} {kind} q_proj", proj_shape(f"{p}.q_proj"),
-              (16 * head_dim // tp_size, mc.hidden_size // pack))
-        check(f"L{layer_id} {kind} k_proj", proj_shape(f"{p}.k_proj"),
-              (kv_local * head_dim, mc.hidden_size // pack))
+        # q/k(/v) are ONE merged projection (LinearQKVMerged): rank-local q rows, then k, then v on
+        # the sliding layers only — a full layer's V is derived from k_proj, so it has no v slice.
+        n_kv_parts = 2 if kind == "sliding" else 1
+        check(f"L{layer_id} {kind} qkv_proj", proj_shape(f"{p}.qkv_proj"),
+              ((16 // tp_size + n_kv_parts * kv_local) * head_dim, mc.hidden_size // pack))
         check(f"L{layer_id} {kind} o_proj", proj_shape(f"{p}.o_proj"),
               (mc.hidden_size, 16 * head_dim // tp_size // pack))
         check(f"L{layer_id} {kind} q_norm", tuple(sd[f"{p}.q_norm.weight"].shape), (head_dim,))
-        # v_proj must be ABSENT on the full layers and PRESENT on the sliding ones — building one
-        # the checkpoint does not ship would fail the loader's exact-key check.
-        check(f"L{layer_id} {kind} has v_proj",
-              f"{p}.v_proj.weight_packed" in sd, kind == "sliding")
+        check(f"L{layer_id} {kind} no separate q/k/v_proj",
+              any(f"{p}.{m}_proj.weight_packed" in sd for m in "qkv"), False)
 
     print("\n[shapes] the easily-missed per-layer scalars and router rescalings")
     check("layer_scalar", tuple(sd["model.layers.0.layer_scalar"].shape), (1,))
@@ -120,9 +118,8 @@ def main() -> int:
     ):
         check(norm, sum(1 for k in sd if k.endswith(f".{norm}.weight")), mc.num_layers)
 
-    check("v_proj count (sliding only)",
-          sum(1 for k in sd if k.endswith(".v_proj.weight_packed")),
-          mc.num_layers - len(FULL_LAYERS))
+    check("qkv_proj count (every layer)",
+          sum(1 for k in sd if k.endswith(".qkv_proj.weight_packed")), mc.num_layers)
     check("lm_head tied (no own weight)",
           "lm_head.weight" in sd, False)
 

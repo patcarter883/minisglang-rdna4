@@ -2651,6 +2651,28 @@ def _shard_gemma4(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.T
     return t
 
 
+_GEMMA4_QKV = re.compile(r"^(?P<pre>.+\.self_attn)\.(?P<proj>[qkv])_proj\.(?P<leaf>[^.]+)$")
+
+
+def _gemma4_qkv_merge(native_key: str, config) -> tuple[str, str, tuple[str, ...]] | None:
+    """q/k/v_proj leaf -> (merged `qkv_proj` key, this slot, the layer's ordered slots), else None.
+
+    Gemma4Attention holds ONE LinearQKVMerged; the checkpoint ships three. The members are per
+    layer: a sliding layer has (q, k, v); a full layer has (q, k) when `attention_k_eq_v` drops its
+    v_proj. The parts arrive already TP-sharded (`_shard_gemma4`, which also REPLICATES kv heads that
+    do not divide the TP size), so stacking them on dim 0 lays out exactly the rank-local
+    [q | k | v] rows the merged linear expects. compressed-tensors packs along the INPUT dim, so the
+    packed weight and its scale both concatenate on the output dim 0, like a bf16 `.weight`."""
+    m = _GEMMA4_QKV.match(native_key)
+    if m is None:
+        return None
+    sliding = _gemma4_layer_is_sliding(native_key, config)
+    slots = ("q", "k", "v") if (sliding or not config.attention_k_eq_v) else ("q", "k")
+    if m.group("proj") not in slots:
+        raise ValueError(f"Gemma4 loader: {native_key!r} is a v_proj on a layer that ships none")
+    return f"{m.group('pre')}.qkv_proj.{m.group('leaf')}", m.group("proj"), slots
+
+
 def _load_gemma4_weight(
     model_folder: str, device: torch.device, config
 ) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -2663,6 +2685,15 @@ def _load_gemma4_weight(
     _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
 
     def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+        if (qm := _gemma4_qkv_merge(native_key, config)) is not None:
+            merged_key, slot, slots = qm
+            merge_buf.setdefault(merged_key, {})[slot] = tensor
+            if len(merge_buf[merged_key]) != len(slots):
+                return
+            parts = [merge_buf[merged_key][s] for s in slots]
+            del merge_buf[merged_key]
+            yield merged_key, torch.cat(parts, dim=0)
+            return
         if (mm := _gate_up_merge(native_key)) is not None:
             merged_key, slot = mm
             merge_buf.setdefault(merged_key, {})[slot] = tensor
@@ -2715,7 +2746,7 @@ def _load_gemma4_weight(
                     tie_decoder[native] = raw
                 yield from emit(native, raw)
 
-    assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
+    assert not merge_buf, f"incomplete gate/up or q/k/v merges in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"incomplete expert stacks in checkpoint: {expert_buf.pending}"
     for key, enc in tie_encoder.items():
         dec = tie_decoder.get(key)
