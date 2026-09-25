@@ -49,6 +49,7 @@ from minisgl.layers import (
     VocabParallelEmbedding,
     gelu_tanh_and_mul,
 )
+from minisgl.layers import _tail_hip
 from minisgl.layers.norm import RMSNormNoScale
 from minisgl.layers.tp_overlap import ar_span, overlap_active, tp_overlap_chunks
 from minisgl.distributed import DistributedCommunicator
@@ -183,6 +184,25 @@ class Gemma4Attention(BaseOP):
         # it back off the key would silently rotate the values.
         v_src = (self.v_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
                  if self.v_proj is not None else k)
+        rot = self.attn.rotary
+        if (hasattr(_tail_hip, "gemma4_qkv_prep") and rot is not None and not rot.interleave
+                and q.dtype in (torch.float16, torch.bfloat16) and self.q_norm.weight.dtype == q.dtype
+                and self._head_dim % 8 == 0 and rot.rotary_dim % 16 == 0):
+            # FUSED front end (tail_hip.gemma4_qkv_prep): q/k weighted norm + NeoX rope and v's
+            # unweighted norm in ONE launch, writing contiguous q/k/v straight for the backend —
+            # replacing v_norm, the cat, q/k_norm's norm + copy_, and rope's contiguous copies + two
+            # rope launches. Bit-identical (tail/tests/test_gemma4_fusions.py).
+            ctx = get_global_ctx()
+            qo, ko, vo = _tail_hip.gemma4_qkv_prep(
+                q.contiguous(), k.contiguous(), v_src.contiguous(), self.q_norm.weight, self.k_norm.weight,
+                ctx.batch.positions.to(torch.int32), rot._cos_sin_cache, self.attn.num_qo_heads,
+                self._nkv_local, self._head_dim, rot.rotary_dim, self.q_norm.eps,
+            )
+            o = ctx.attn_backend.forward(
+                qo.view(-1, self.attn.num_qo_heads, self._head_dim), ko, vo, self.attn.layer_id, ctx.batch,
+                sliding_window=self.attn.sliding_window,
+            )
+            return self.o_proj.forward(o.view(-1, self.attn.qo_attn_dim))
         v = self._v_norm.forward(v_src.view(n, self._nkv_local, self._head_dim)).view(n, -1)
         # AttentionLayer q/k-norms and RoPEs the q,k slices in place; v is a copy made by the cat,
         # so the pre-RoPE value computed above survives untouched.
@@ -221,6 +241,20 @@ class Gemma4Router(BaseOP):
         w, idx = torch.topk(probs, k=self._top_k, dim=-1)
         w = w / w.sum(dim=-1, keepdim=True)
         return w * self.per_expert_scale.float()[idx], idx
+
+    def post_load(self) -> None:
+        # The fused route reads the per-expert scale in the logits' dtype: cast it ONCE here rather
+        # than on every call (a cast per layer per step is exactly the launch count being removed).
+        self._pes = self.per_expert_scale.to(self.weight.dtype).contiguous()
+        self._post_load_done = True
+
+    def route_normed(self, n_router: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """`forward` from the router's ALREADY-normalized input (gemma4_attn_tail emits it): the
+        M-invariant GEMM, then softmax + top-k + renormalize + per-expert scale in one kernel. The
+        same route as `forward` up to exact probability ties, which may be ordered either way."""
+        from minisgl.layers.minv import minv_linear
+
+        return _tail_hip.gemma4_route(minv_linear(n_router, self.weight), self._pes, self._top_k)
 
 
 class Gemma4DenseMLP(BaseOP):
@@ -315,6 +349,33 @@ class Gemma4DecoderLayer(BaseOP):
         ar_moe = span.all_reduce(moe_partial)
         return ar_dense, ar_moe, residual
 
+    def _fused_ok(self, o: torch.Tensor) -> bool:
+        """The fused hand-off/route/combine kernels (tail_hip) apply: present in this image, a 16-bit
+        activation, and the b128 row path (hidden % 8)."""
+        return (hasattr(_tail_hip, "gemma4_attn_tail") and o.dtype in (torch.float16, torch.bfloat16)
+                and o.shape[-1] % 8 == 0 and hasattr(self.router, "_pes")
+                and self.router.scale.dtype == o.dtype and self.layer_scalar.dtype == o.dtype)
+
+    def _ffn_fused(self, h, n_dense, n_moe, n_router, span: "ar_span") -> tuple:
+        """`_ffn` over the three normalized views gemma4_attn_tail produced in one pass."""
+        dense_partial = self.mlp.forward(n_dense, reduce=False)
+        ar_dense = span.all_reduce(dense_partial)
+        topk_weights, topk_ids = self.router.route_normed(n_router)
+        moe_partial = self.experts.forward(
+            hidden_states=n_moe, topk_weights=topk_weights, topk_ids=topk_ids, reduce=False,
+        )
+        ar_moe = span.all_reduce(moe_partial)
+        return ar_dense, ar_moe, h
+
+    def _combine_fused(self, ar_dense, ar_moe, residual: torch.Tensor) -> torch.Tensor:
+        """`_combine` in one kernel: both post-norms, their sum, the outer norm, the residual add and
+        the layer scalar — bit-identical to the chain."""
+        return _tail_hip.gemma4_ffn_combine(
+            ar_dense.wait().contiguous(), ar_moe.wait().contiguous(), residual,
+            self.post_feedforward_layernorm_1.weight, self.post_feedforward_layernorm_2.weight,
+            self.post_feedforward_layernorm.weight, self.layer_scalar, self.post_feedforward_layernorm.eps,
+        )
+
     def _combine(self, ar_dense, ar_moe, residual: torch.Tensor) -> torch.Tensor:
         dense = self.post_feedforward_layernorm_1.forward(ar_dense.wait())
         moe = self.post_feedforward_layernorm_2.forward(ar_moe.wait())
@@ -332,6 +393,31 @@ class Gemma4DecoderLayer(BaseOP):
         # native kernel does not apply, so this call site needs no gate on the checkpoint.
         h, h_fp8, h_scales = self.input_layernorm.forward_quant(x)
         h = self.self_attn.forward(h, h_fp8, h_scales)
+        if self._fused_ok(h):
+            # FUSED (tail_hip): the post-attention norm, the residual add, and all three normalized
+            # views the FFN half reads — the dense pre-norm, the MoE pre-norm and the router's scaled
+            # unweighted norm — in ONE pass instead of seven launches; and below, routing in one
+            # kernel after the router GEMM, and the whole combine in one. A bs=1 decode issued 1712
+            # kernels/token against vLLM's 766 on the same cards, at ~3.5 us of graph-replay dead time
+            # per kernel boundary. Bit-identical to the chain (tail/tests/test_gemma4_fusions.py)
+            # except the ordering of exactly-tied experts.
+            h, n_dense, n_moe, n_router = _tail_hip.gemma4_attn_tail(
+                h.contiguous(), residual.contiguous(), self.post_attention_layernorm.weight,
+                self.pre_feedforward_layernorm.weight, self.pre_feedforward_layernorm_2.weight,
+                self.router.scale, self.router._scalar_root_size, self.post_attention_layernorm.eps,
+            )
+            n = h.shape[0]
+            k = tp_overlap_chunks()
+            with ar_span(self._comm) as span:
+                if k <= 1 or n < 2 * k or not overlap_active(h):
+                    return self._combine_fused(*self._ffn_fused(h, n_dense, n_moe, n_router, span))
+                bounds = [(n * i) // k for i in range(k + 1)]
+                pending = [
+                    self._ffn_fused(h[bounds[i]:bounds[i + 1]], n_dense[bounds[i]:bounds[i + 1]],
+                                    n_moe[bounds[i]:bounds[i + 1]], n_router[bounds[i]:bounds[i + 1]], span)
+                    for i in range(k)
+                ]
+                return torch.cat([self._combine_fused(*p) for p in pending], dim=0)
         # Post-norm on the attention OUTPUT, then the residual add — not the usual pre-norm order,
         # so the fused rmsnorm+residual-add op does not apply here.
         h = self.post_attention_layernorm.forward(h)

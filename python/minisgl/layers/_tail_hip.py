@@ -61,6 +61,12 @@ if ENABLED:
     # That is precisely the failure mode this file's own docstring already warns about for fp16.
     _rms_norm_quant = getattr(tail_hip, "rms_norm_quant", None)
     _rms_norm_add_quant = getattr(tail_hip, "rms_norm_add_quant", None)
+    # Gemma-4 decoder-layer fusions (see Gemma4DecoderLayer): absent on an older image, and then the
+    # layer runs the unfused chain — so each gets an engage line like every other op.
+    _gemma4_attn_tail = getattr(tail_hip, "gemma4_attn_tail", None)
+    _gemma4_ffn_combine = getattr(tail_hip, "gemma4_ffn_combine", None)
+    _gemma4_route = getattr(tail_hip, "gemma4_route", None)
+    _gemma4_qkv_prep = getattr(tail_hip, "gemma4_qkv_prep", None)
 
     def silu_and_mul(*args, **kwargs):
         _engaged("tail_hip.silu_and_mul")
@@ -100,6 +106,24 @@ if ENABLED:
         def rms_norm_add_quant(*args, **kwargs):
             _engaged("tail_hip.rms_norm_add_quant")
             return _rms_norm_add_quant(*args, **kwargs)
+
+    if _gemma4_attn_tail is not None and _gemma4_ffn_combine is not None and _gemma4_route is not None:
+        def gemma4_attn_tail(*args, **kwargs):
+            _engaged("tail_hip.gemma4_attn_tail")
+            return _gemma4_attn_tail(*args, **kwargs)
+
+        def gemma4_ffn_combine(*args, **kwargs):
+            _engaged("tail_hip.gemma4_ffn_combine")
+            return _gemma4_ffn_combine(*args, **kwargs)
+
+        def gemma4_route(*args, **kwargs):
+            _engaged("tail_hip.gemma4_route")
+            return _gemma4_route(*args, **kwargs)
+
+    if _gemma4_qkv_prep is not None:
+        def gemma4_qkv_prep(*args, **kwargs):
+            _engaged("tail_hip.gemma4_qkv_prep")
+            return _gemma4_qkv_prep(*args, **kwargs)
 
     if _gelu_and_mul is not None:
         def gelu_and_mul(*args, **kwargs):
