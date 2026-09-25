@@ -372,10 +372,10 @@ class OpenAICompletionRequest(BaseModel):
     metadata: dict | None = None
     service_tier: str | None = None
     parallel_tool_calls: bool | None = None
-    # logprobs IS honoured on the non-streaming /v1/completions lane (classic int form: top-N per
-    # generated token, capped at 20 — see v1_text_completions). Everywhere else — chat, streaming —
-    # it is still a clear 400, not a silently-ignored field. top_logprobs alone remains chat-only
-    # vocabulary and is rejected with it.
+    # logprobs are honoured on the NON-STREAMING lanes: /v1/completions in the classic int form
+    # (top-N per generated token, capped at 20 — see v1_text_completions), /v1/chat/completions in the
+    # chat form (`logprobs: true` + `top_logprobs` 0..20). Streaming is still a clear 400, not a
+    # silently-ignored field.
     logprobs: int | bool | None = None
     top_logprobs: int | None = None
     logit_bias: dict | None = None
@@ -1483,9 +1483,10 @@ def _reject_unsupported(req: "OpenAICompletionRequest",
             "message": msg, "type": "invalid_request_error", "param": param, "code": code}})
 
     if (req.logprobs or req.top_logprobs is not None) and not allow_logprobs:
-        return bad("logprobs / top_logprobs are not supported on this endpoint. Per-token logprobs "
-                   "are available on NON-STREAMING /v1/completions only (classic int form, "
-                   "capped at 20).", "logprobs")
+        return bad("logprobs / top_logprobs are not supported on a streaming request. Per-token "
+                   "logprobs are available on NON-STREAMING /v1/completions (classic int form) and "
+                   "/v1/chat/completions (logprobs: true + top_logprobs), top-N capped at 20.",
+                   "logprobs")
     if req.logit_bias:
         return bad("logit_bias is not supported by this server.", "logit_bias")
     if req.n is not None and req.n != 1:
@@ -3575,9 +3576,23 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     # registration was (and is) `/v1/chat/completions`, so `/v1/completions` was a bare FastAPI 404
     # and the misleading symbol is what made the hole look filled on a read of the file. The real
     # `/v1/completions` is now its own handler below — this one is chat, and answers `chat.completion`.
-    _bad = _reject_unsupported(req) or _reject_unclosed_toolcall_continuation(req)
+    _bad = (_reject_unsupported(req, allow_logprobs=not req.stream)
+            or _reject_unclosed_toolcall_continuation(req))
     if _bad is not None:
         return _bad
+    # Chat-form logprobs: `logprobs: true` turns them on, `top_logprobs` (0..20) sets the alternatives
+    # per token. The engine always reports the sampled token, so top-0 still asks it for 1 entry.
+    lp_n = 0
+    if req.top_logprobs is not None and not 0 <= int(req.top_logprobs) <= 20:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "top_logprobs must be an integer in [0, 20].", "type": "invalid_request_error",
+            "param": "top_logprobs", "code": "invalid_value"}})
+    if req.top_logprobs is not None and not req.logprobs:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "top_logprobs requires logprobs: true.", "type": "invalid_request_error",
+            "param": "top_logprobs", "code": "invalid_value"}})
+    if req.logprobs:
+        lp_n = max(1, int(req.top_logprobs or 0))
     state = get_global_state()
 
     # In-engine Markovian RSA (opt-in per call via the `rsa` field). When enabled, the WHOLE
@@ -3591,6 +3606,11 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     # depth. An explicit `rsa` — including `false` — always wins over the ladder.
     rsa_params = (merge_params(state.config.rsa_defaults, req.rsa) if req.rsa is not None
                   else _rsa_from_effort(req, state.config))
+    if rsa_params is not None and lp_n:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "logprobs are not available with rsa: the reply is aggregated from several "
+                       "rollouts, so no single token sequence carries them.",
+            "type": "invalid_request_error", "param": "logprobs", "code": "unsupported_parameter"}})
     if rsa_params is not None:
         if not req.messages:
             return JSONResponse(
@@ -3788,6 +3808,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 think_budget=_resolve_think_budget(req, state.config.model_path),
                 tool_match_gated=_tool_match_gated(),
                 think_span_open=_thinking_open(req),
+                logprobs=lp_n,
             ),
         )
     )
@@ -3824,6 +3845,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     # chunks in a list and "".join once at the end — string `+=` in the loop is O(n^2) in the output
     # length for long completions.
     content_chunks: List[str] = []
+    lp_entries: List[Dict] = []
     prompt_tokens = completion_tokens = 0
     finish_reason = "stop"
     rejected: str | None = None
@@ -3849,6 +3871,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             rejected = ack.error
             break
         content_chunks.append(ack.incremental_output)
+        if lp_n and getattr(ack, "logprobs", None):
+            lp_entries.append(ack.logprobs)
         completion_tokens = max(completion_tokens, ack.completion_tokens)
         prompt_tokens = ack.prompt_tokens or prompt_tokens
         if ack.finish_reason:
@@ -4012,6 +4036,14 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             {
                 "index": 0,
                 "message": message,
+                # Chat-form logprobs over EVERY generated token, reasoning span included (the split
+                # into reasoning_content happens on text, after sampling). "id" is an extension: the
+                # token string alone collides for byte-identical detokenizations.
+                "logprobs": None if not lp_n else {"content": [
+                    {"token": e["token"], "logprob": e["logprob"], "id": e.get("token_id"),
+                     "top_logprobs": [{"token": t["token"], "logprob": t["logprob"], "id": t.get("id")}
+                                      for t in e["top"][:int(req.top_logprobs or 0)]]}
+                    for e in lp_entries]},
                 "finish_reason": finish_reason,
             }
         ],
