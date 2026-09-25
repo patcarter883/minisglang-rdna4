@@ -66,7 +66,7 @@ if ENABLED:
     _gemma4_attn_tail = getattr(tail_hip, "gemma4_attn_tail", None)
     _gemma4_ffn_combine = getattr(tail_hip, "gemma4_ffn_combine", None)
     _gemma4_route = getattr(tail_hip, "gemma4_route", None)
-    _gemma4_qkv_prep = getattr(tail_hip, "gemma4_qkv_prep", None)
+    _qk_norm_rope = getattr(tail_hip, "qk_norm_rope", None)
 
     def silu_and_mul(*args, **kwargs):
         _engaged("tail_hip.silu_and_mul")
@@ -120,10 +120,10 @@ if ENABLED:
             _engaged("tail_hip.gemma4_route")
             return _gemma4_route(*args, **kwargs)
 
-    if _gemma4_qkv_prep is not None:
-        def gemma4_qkv_prep(*args, **kwargs):
-            _engaged("tail_hip.gemma4_qkv_prep")
-            return _gemma4_qkv_prep(*args, **kwargs)
+    if _qk_norm_rope is not None:
+        def qk_norm_rope(*args, **kwargs):
+            _engaged("tail_hip.qk_norm_rope")
+            return _qk_norm_rope(*args, **kwargs)
 
     if _gelu_and_mul is not None:
         def gelu_and_mul(*args, **kwargs):

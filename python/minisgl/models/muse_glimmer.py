@@ -147,7 +147,7 @@ class MuseGlimmerAttention(BaseOP):
         v = self.v_proj.forward(x)
         # [4] The gate reads the LAYER INPUT (the input_layernorm output), not the attention result.
         gate = self.gate_proj.forward(x)
-        o = self.attn.forward(torch.cat([q, k, v], dim=-1))
+        o = self.attn.forward_qkv(q, k, v)
         # sigmoid in fp32 then cast back, matching the reference's `torch.sigmoid` on an fp32-upcast
         # activation; applied elementwise to the concatenated head outputs BEFORE o_proj.
         o = o * torch.sigmoid(gate.float()).to(o.dtype)

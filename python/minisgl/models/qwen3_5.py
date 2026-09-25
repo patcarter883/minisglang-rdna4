@@ -169,12 +169,12 @@ class Qwen3_5Attn(BaseOP):
         n = x.shape[0]
         hd = self._head_dim
         qg = self.q_proj.forward(x).view(n, self._num_qo_heads, 2 * hd)
-        q = qg[..., :hd].reshape(n, self._num_qo_heads * hd)
+        q = qg[..., :hd]  # [n, heads, hd] view, head stride 2*hd — read in place, never copied
         gate = qg[..., hd:].reshape(n, self._num_qo_heads * hd)
         k = self.k_proj.forward(x)
         v = self.v_proj.forward(x)
         # AttentionLayer applies q_norm/k_norm (over head_dim) then partial rotary, then attn.
-        o = self.attn.forward(torch.cat([q, k, v], dim=-1), selection)
+        o = self.attn.forward_qkv(q, k, v, selection=selection)
         o = o * torch.sigmoid(gate)
         return self.o_proj.forward(o)
 

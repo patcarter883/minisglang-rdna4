@@ -176,7 +176,6 @@ class Gemma4Attention(BaseOP):
         the pair each one re-reads (M, K) and launches its own `compute_act_fp8_and_scales_kernel` —
         the same activation quantized three times per layer. Bit-identical when it fires; `None` (an
         unquantized checkpoint, or a tail_hip predating the op) just restores exactly that."""
-        n = x.shape[0]
         q = self.q_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
         k = self.k_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
         # On a full layer V reuses k_proj's OUTPUT, not the cached key: the key that reaches the KV
@@ -184,29 +183,10 @@ class Gemma4Attention(BaseOP):
         # it back off the key would silently rotate the values.
         v_src = (self.v_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
                  if self.v_proj is not None else k)
-        rot = self.attn.rotary
-        if (hasattr(_tail_hip, "gemma4_qkv_prep") and rot is not None and not rot.interleave
-                and q.dtype in (torch.float16, torch.bfloat16) and self.q_norm.weight.dtype == q.dtype
-                and self._head_dim % 8 == 0 and rot.rotary_dim % 16 == 0):
-            # FUSED front end (tail_hip.gemma4_qkv_prep): q/k weighted norm + NeoX rope and v's
-            # unweighted norm in ONE launch, writing contiguous q/k/v straight for the backend —
-            # replacing v_norm, the cat, q/k_norm's norm + copy_, and rope's contiguous copies + two
-            # rope launches. Bit-identical (tail/tests/test_gemma4_fusions.py).
-            ctx = get_global_ctx()
-            qo, ko, vo = _tail_hip.gemma4_qkv_prep(
-                q.contiguous(), k.contiguous(), v_src.contiguous(), self.q_norm.weight, self.k_norm.weight,
-                ctx.batch.positions.to(torch.int32), rot._cos_sin_cache, self.attn.num_qo_heads,
-                self._nkv_local, self._head_dim, rot.rotary_dim, self.q_norm.eps,
-            )
-            o = ctx.attn_backend.forward(
-                qo.view(-1, self.attn.num_qo_heads, self._head_dim), ko, vo, self.attn.layer_id, ctx.batch,
-                sliding_window=self.attn.sliding_window,
-            )
-            return self.o_proj.forward(o.view(-1, self.attn.qo_attn_dim))
-        v = self._v_norm.forward(v_src.view(n, self._nkv_local, self._head_dim)).view(n, -1)
-        # AttentionLayer q/k-norms and RoPEs the q,k slices in place; v is a copy made by the cat,
-        # so the pre-RoPE value computed above survives untouched.
-        o = self.attn.forward(torch.cat([q, k, v], dim=-1))
+        # AttentionLayer runs q/k_norm + RoPE and this layer's scale-less v_norm (one fused launch
+        # when tail_hip.qk_norm_rope applies). v_src may BE k's projection output; it is read before
+        # anything is written.
+        o = self.attn.forward_qkv(q, k, v_src, v_norm_eps=self._v_norm.eps)
         return self.o_proj.forward(o)
 
 

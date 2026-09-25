@@ -140,7 +140,7 @@ class NemotronHAttention(BaseOP):
         q = self.q_proj.forward(x)
         k = self.k_proj.forward(x)
         v = self.v_proj.forward(x)
-        o = self.attn.forward(torch.cat([q, k, v], dim=-1))
+        o = self.attn.forward_qkv(q, k, v)
         return self.o_proj.forward(o)
 
 
