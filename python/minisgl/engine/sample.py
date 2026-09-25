@@ -159,6 +159,10 @@ class Sampler:
     # does not cap itself (BaseLLMModel.applies_logit_softcap) — capping twice flattens the
     # distribution (see there). None = no-op.
     logit_softcap: float | None = None
+    # TP degree. At TP>1 every rank samples, but RANK 0's tokens are what every rank commits — see
+    # `_rank0_tokens`.
+    tp_size: int = 1
+    _tp_comm: object = None
     # uid -> [vocab] float32 count of tokens that request has generated. Created lazily for penalised
     # requests only (~1 MB each at a 248k vocab) and updated incrementally by one index_add per step,
     # so the cost does not grow with output length. Released by `free_penalty_state` on finish.
@@ -244,6 +248,33 @@ class Sampler:
             seen[t] += 1
             after = presence * (seen[t] > 0).to(block.dtype) + frequency * seen[t]
             block[i + 1:, t] -= (after - before)
+
+    def _rank0_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """At TP>1, replace this rank's sampled tokens with rank 0's, on device.
+
+        Every rank samples from the same all-gathered logits with its own default generator, and
+        only luck kept those in lockstep: both are seeded 42, but PyTorch advances a generator's
+        Philox offset per random kernel by an amount set by the LAUNCH GRID, i.e. by the card's CU
+        count. On this box's mismatched pair (64 vs 56 CUs) any large default-RNG draw on each rank
+        — MEASURED: one 1.87M-element randint — leaves the two streams permanently apart (small
+        draws like the sampler's own advance both equally, which is why it held until one landed).
+        With a vision warm-up doing exactly that, Gemma-4 26B TP=2 at temperature 0.9 committed
+        DIFFERENT tokens on the two ranks on 254 of ~960 sampled steps, with bit-identical logits. Each rank then feeds its own token back, so the ranks' contexts
+        (and KV) desync while the user reads rank 0's text — mid-word switches and doubled fragments
+        ("EThelias", "side byby-side") at every near-tie. The canvas sampler hit and fixed the same
+        thing by taking rank 0's deviates (diffusion/sampler.py); here the whole token is taken, which
+        also covers a near-tie that cross-rank logit rounding would split (the grammar-masked case).
+
+        One pure-data all_gather of `[bs]` int32 — no host sync. Applied BEFORE the penalty commit and
+        the logprob capture, so the per-rank penalty counts and the reported token agree with it."""
+        if self.tp_size == 1:
+            return tokens
+        if self._tp_comm is None:
+            from minisgl.distributed import DistributedCommunicator
+
+            self._tp_comm = DistributedCommunicator()
+        tokens = tokens.to(torch.int32).contiguous()
+        return self._tp_comm.all_gather(tokens)[: tokens.shape[0]]
 
     def _commit_penalty(self, tokens: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         """Fold the tokens just drawn into the penalised rows' running counts — one index_add per
@@ -376,11 +407,11 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 # Penalties apply to greedy too: they change which token is the argmax, which is the
                 # entire point of asking for them at temperature 0.
-                tokens = self._commit_penalty(torch.argmax(logits, dim=-1), args)
+                tokens = self._commit_penalty(self._rank0_tokens(torch.argmax(logits, dim=-1)), args)
             else:
-                tokens = self._commit_penalty(
+                tokens = self._commit_penalty(self._rank0_tokens(
                     sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p,
-                                args.min_p), args)
+                                args.min_p)), args)
             if _lp_full is not None:
                 self._finish_logprob_capture(_lp_full, tokens, args)
             return tokens

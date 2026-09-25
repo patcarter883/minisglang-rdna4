@@ -765,7 +765,7 @@ class Engine:
         # The final-logit softcap is applied exactly ONCE: by the model when its forward already caps
         # (BaseLLMModel.applies_logit_softcap), otherwise here by the sampler.
         self.sampler = Sampler(self.device, config.model_config.vocab_size,
-                               real_vocab_size=_real_vocab,
+                               real_vocab_size=_real_vocab, tp_size=self.tp_size,
                                logit_softcap=None if getattr(self.model, "applies_logit_softcap", False)
                                else getattr(config.model_config, "final_logit_softcapping", None))
 
@@ -2271,20 +2271,10 @@ class Engine:
         for req in batch.reqs:
             req.complete_one()
 
+        # At TP>1 these are RANK 0's tokens on every rank (Sampler._rank0_tokens), grammar-masked or
+        # not, so the host sequences and the KV pools commit the same token everywhere.
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-        if args.grammar_bitmask is not None and self.tp_size > 1:
-            # Structured output at TP>1: the grammar bitmask makes per-rank token selection DIVERGE —
-            # it amplifies tiny cross-rank logit FP differences over the small allowed/renormalized
-            # set, so multinomial sampling (and, at a near-tie, even argmax) can pick a different token
-            # on each rank. Divergent commits desync the decode managers and deadlock the collectives
-            # (and KV would silently differ). Force rank0's tokens onto every rank for an identical
-            # commit (host seq + KV pool). Scoped to constrained batches; they already run the
-            # synchronous decode path, so the extra D2H + CPU broadcast is cheap.
-            next_tokens_cpu = next_tokens_gpu.to("cpu")
-            self.tp_cpu_group.broadcast(next_tokens_cpu, root=0).wait()
-            next_tokens_gpu = next_tokens_cpu.to(next_tokens_gpu.device)
-        else:
-            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         out = ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event,
