@@ -212,13 +212,7 @@ case "$MODEL" in
                   model_id="RedHatAI/Muse-Glimmer-30B-NVFP4"; served_name="Muse-Glimmer-30B";
                   spec_default="none"
                   tool_format="atem"; min_tp=2
-                  # 0.75 (was 0.85, copied from Laguna). Measured 2026-09-26, TP=2, 16 GB cards: the
-                  # NVFP4 post_load leaves ~2 GiB of torch reserved-but-unallocated fragmentation
-                  # (11.62 -> 13.60 GiB) and the model term's non-torch share swings ~1 GiB boot to
-                  # boot, so at 0.85 the base boot OOM'd 2 of 3 times (KV pool or graph capture), and
-                  # with the attention q/k/v/gate fused it failed at 0.85 AND 0.80. At 0.75 both boot
-                  # and serve (base 40.1, fused 44.8 tok/s). Fixtures:
-                  # /home/pat/fixtures/gemv-splitk-merge-20260926 (ab3/ab5/ab7).
+                  # 0.75: at 0.85/0.80 the boot runs out of VRAM (KV pool or graph capture) on 16 GB cards.
                   mem_default="0.75"
                   # DFlash block-diffusion drafter, block_size 16 -> at most 15 drafts per step
                   # (the block is [anchor, 15 masks]), captured from target layers 1/13/25/37/49.

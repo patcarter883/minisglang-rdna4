@@ -833,23 +833,11 @@ class NvFp4LinearMethod:
 
 
 class Fp8BlockLinearMethod:
-    """DeepSeek-style BLOCKWISE fp8 (e4m3 weights + a 2-D scale per `block_structure` tile), served
-    NATIVELY: the weight stays one byte, the block scale rides the shared W8A16 cores as a K-group
-    scale policy.
-
-    It used to be dequantized to bf16 at load (the class was `Fp8BlockLinearMethod`), on the
-    premise that no kernel consumes a 2-D weight scale. But a (128 x 128) block scale is a K-GROUP
-    scale repeated down 128 output rows: expanded at load into a group-major (K/128, N) f32 plane it is
-    exactly the kind of scale the decode core already folds per chunk for every 4-bit format. So:
-      * decode (M <= 16): fp8_wmma.dense_w8a16_gemv -> W8A16GroupGemvLoader (scale per 16-k chunk);
-      * prefill: fp8_wmma.dense_w8a16_gemm -> W8A16Group128Loader, which dequantises each weight WITH
-        its scale as it stages into LDS — the same `(w.float() * scale).to(act)` rounding the load-time
-        dequant produced, so prefill arithmetic is unchanged.
-    What that buys on Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ (its attention and GDN projections): ~1.3 GiB
-    per card at TP=2 back to the KV pool / expert cache, and half the bytes those GEMVs read per token.
-
-    A block other than 128 along K keeps the exact load-time dequant (the tiled loader's group is a
-    compile-time 128, the one block these checkpoints use) and says so once.
+    """DeepSeek-style blockwise fp8 (e4m3 weight + a 2-D scale per `block_structure` tile), served
+    natively on the W8A16 cores: the weight stays one byte, and the (N/bn, K/128) tile scale is
+    expanded at load into a group-major (K/128, N) f32 K-group plane. Decode uses dense_w8a16_gemv,
+    prefill dense_w8a16_gemm (dequant-at-staging, the same rounding as a load-time dequant). A K-block
+    other than 128 is dequantized to bf16 at load instead.
     """
 
     def __init__(self, quant: QuantConfig) -> None:

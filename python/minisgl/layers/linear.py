@@ -156,11 +156,9 @@ class LinearQKVMerged(_LinearTPImpl):
         quant_method: "LinearMethod | None" = None,
         has_v: bool = True,
     ):
-        """One column-parallel GEMM for [q | k | v] (or [q | k] with `has_v=False`: a layer whose V
-        is derived from k_proj's output, like Gemma-4's full attention). Per rank the output is the
-        local q heads, then the local kv heads — replicated rather than split when they do not
-        divide the TP size — so the loader must stack each rank's q/k/v SHARDS, never shard a
-        pre-merged tensor (that would hand rank 1 the tail of q and the head of k)."""
+        """One column-parallel GEMM for [q | k | v], or [q | k] with `has_v=False`. Per rank: local q
+        heads, then local kv heads (replicated when they do not divide TP), so the loader stacks
+        each rank's q/k/v shards."""
         tp_info = get_tp_info()
 
         local_num_qo = div_even(num_qo_heads, tp_info.size)

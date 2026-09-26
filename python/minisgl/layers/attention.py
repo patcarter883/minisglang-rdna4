@@ -80,21 +80,9 @@ class AttentionLayer(StateLessOP):
         v_norm_eps: float | None = None,
         selection: object | None = None,
     ) -> torch.Tensor:
-        """q/k norm -> RoPE -> attention, from SEPARATE q/k/v — views are fine: [n, heads*hd] with
-        any row stride (the split of a fused projection), or q as [n, heads, hd] with any head stride
-        (Qwen3.5's q, interleaved per head with its gate). Callers holding three projection outputs
-        pass them straight here instead of `torch.cat`-ing them for `forward` to split again.
-
-        `v_norm_eps`: also apply the scale-less RMSNorm to v (Gemma-4's `v_norm`). v may BE k (a
-        Gemma-4 full layer's V is k_proj's raw output): nothing here writes into the inputs before v
-        has been read.
-
-        `selection` is a `minisgl.attention.qsa.QSASelection` on a QSA full-attention layer.
-        It changes exactly ONE thing: which backend entry point the (already normed, already roped)
-        q/k/v go to. Everything above that line — the q/k norms, the partial rotary, the contiguity
-        invariant — is byte-identical between the dense and the sparse call, which is what makes
-        "sparse == dense when the selection is everything" a statement about the attention kernel
-        alone rather than about two independently-assembled forwards."""
+        """q/k norm -> RoPE -> attention from separate q/k/v (views are fine: [n, heads*hd] with any
+        row stride, or q as [n, heads, hd] with any head stride). `v_norm_eps` also applies the
+        scale-less norm to v; v may be k. `selection` (QSA) only changes the backend entry point."""
         ctx = get_global_ctx()
         q, k, v = self.qk_prep.forward(q, k, v, ctx.batch.positions, v_norm_eps=v_norm_eps)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
@@ -110,15 +98,9 @@ class AttentionLayer(StateLessOP):
 
 
 class QKNormRope(StateLessOP):
-    """The attention front end: per-head q/k norm, then RoPE (and, for Gemma-4, v's scale-less norm).
-
-    ONE launch (tail_hip.qk_norm_rope) where the kernel can express the layer — for what is otherwise
-    q_norm + k_norm (a norm and a copy_ back each), rope's two .contiguous() copies and two rope
-    launches, plus Gemma-4's v_norm — and otherwise exactly that op chain. Bit-identical either way
-    (tail/tests/test_qk_norm_rope.py), so which one ran is a performance fact, never a numerics one.
-    Owned by every AttentionLayer, and by the drafters that attend outside one (DFlash, the Qwen3.5
-    draft-KV ring) so they cannot drift from it. Holds references to its norms, not copies: the
-    owning model's attributes are what the loader fills."""
+    """Per-head q/k norm, then RoPE (and optionally v's scale-less norm) — the attention front end
+    shared by AttentionLayer and the drafters. One tail_hip.qk_norm_rope launch where the kernel
+    covers the layer, else the op chain; bit-identical either way. Holds references to the norms."""
 
     def __init__(
         self,

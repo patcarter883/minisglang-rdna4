@@ -2656,13 +2656,8 @@ _GEMMA4_QKV = re.compile(r"^(?P<pre>.+\.self_attn)\.(?P<proj>[qkv])_proj\.(?P<le
 
 def _gemma4_qkv_merge(native_key: str, config) -> tuple[str, str, tuple[str, ...]] | None:
     """q/k/v_proj leaf -> (merged `qkv_proj` key, this slot, the layer's ordered slots), else None.
-
-    Gemma4Attention holds ONE LinearQKVMerged; the checkpoint ships three. The members are per
-    layer: a sliding layer has (q, k, v); a full layer has (q, k) when `attention_k_eq_v` drops its
-    v_proj. The parts arrive already TP-sharded (`_shard_gemma4`, which also REPLICATES kv heads that
-    do not divide the TP size), so stacking them on dim 0 lays out exactly the rank-local
-    [q | k | v] rows the merged linear expects. compressed-tensors packs along the INPUT dim, so the
-    packed weight and its scale both concatenate on the output dim 0, like a bf16 `.weight`."""
+    Sliding layers stack (q, k, v); full layers (q, k) when `attention_k_eq_v`. Parts are already
+    TP-sharded, so a dim-0 concat gives the rank-local [q | k | v] rows."""
     m = _GEMMA4_QKV.match(native_key)
     if m is None:
         return None
@@ -3009,12 +3004,8 @@ def _load_muse_glimmer_weight(
                 # through still 4-bit; input_global_scale (the FP4 activation calibration) is
                 # dropped, because the e2m1 kernel quantizes activations to fp8 dynamically.
                 #
-                # NVFP4 is served NATIVE two-level (FORMAT_MATRIX.md G14): `nvfp4_leaf_scales`
-                # returns the e4m3 block scale AND the per-output-channel f32 global for every
-                # module, and each leaf goes through the same remap -> TP shard -> gate/up merge
-                # path below (the global is an N-vector, so it needs no special case there). This
-                # loader used to assert ONE leaf — true only while dense modules were folded — and
-                # so could not boot at all once the dense cores took the native form.
+                # Each NVFP4 leaf (e4m3 block scale, per-channel f32 global) goes through the same
+                # remap -> shard -> gate/up merge path below.
                 leaves = [(name, None)]
                 if _is_nvfp4:
                     if name.endswith(".input_global_scale"):

@@ -181,11 +181,8 @@ class EPCommunicator:
         return x
 
 
-# The PUSH one-shot all-reduce (custom_ar.one_shot_ar_push) for the small collectives. MEASURED
-# (custom_ar/tests/test_push_ar.py, 200 calls captured in a graph, the two cards of this box): 5.5 KiB
-# — the bs=1 decode residual — 10.6 us vs the pull kernel's 17.3; 88 KiB 14.9 vs 17.6; but 1.4 MiB
-# 157 vs 148, where the pull kernel's parallel peer reads win. So: push up to this size, pull above.
-# Both ranks take the same branch because it depends only on the message size.
+# Collectives up to this size use the PUSH one-shot all-reduce; larger ones the pull kernel, whose
+# parallel peer reads win at MiB sizes. Size-only, so both ranks take the same branch.
 PUSH_MAX_BYTES = 128 << 10
 
 

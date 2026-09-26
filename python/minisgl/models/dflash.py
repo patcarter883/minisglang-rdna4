@@ -266,8 +266,7 @@ class _DFlashLayer(BaseOP):
         # draft use the plain-weight convention, NOT the (1+weight) Qwen3.5 one).
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
-        # The shared attention front end (q/k norm + RoPE, one launch where it applies) over the
-        # norms above. `_`-prefixed: it holds references, and must stay out of the state dict.
+        # Shared q/k norm + RoPE front end; `_`-prefixed to stay out of the state dict.
         self._qk = QKNormRope(self.num_heads, self.num_kv_heads, head_dim, self.q_norm, self.k_norm,
                               rotary)
         self.gate_proj = _PlainLinear(hidden_size, intermediate_size, shard=SHARD_COL)

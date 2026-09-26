@@ -102,17 +102,15 @@ class Qwen3_5MoeSparseBlock(BaseOP):
 
     def post_load(self) -> None:
         super().post_load()
-        # The router and the shared-expert gate read the same row and are both replicated bf16:
-        # ONE decode GEMV (layers/same_input_gemv.py) instead of a 256-wide and a 1-wide launch.
+        # Router and shared-expert gate read the same row: one fused call.
         from minisgl.layers.same_input_gemv import fuse_same_input
 
         self._gates_fused = fuse_same_input(
             "qwen3_5_moe.router+shared_expert_gate", (self.gate, self.shared_expert_gate))
 
     def _gates(self, h: torch.Tensor):
-        """(router_logits, shared_expert_gate logit). The routing kernels take raw logits and want
-        them contiguous, so the fused path pays one tiny copy for the router slice — still cheaper
-        than the N=1 GEMV launch it replaces."""
+        """(router_logits, shared_expert_gate logit). The router slice is made contiguous for the
+        routing kernels."""
         fused = getattr(self, "_gates_fused", None)
         if fused is None:
             return self.gate.forward(h), self.shared_expert_gate.forward(h)

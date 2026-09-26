@@ -101,9 +101,7 @@ class MuseGlimmerAttention(BaseOP):
             name = f"{prefix}.{module}"
             return create_linear_method(q, quantized=q is not None and q.is_module_quantized(name))
 
-        # The checkpoint ships q/k/v/gate apart; post_load runs them as ONE call (see there). The
-        # NVFP4 block scales are per (output row, K-group), so an output-dim stack of the four is
-        # just a concat of their scale planes — nothing interleaves.
+        # Shipped apart; post_load fuses q/k/v/gate into one call.
         self.q_proj = LinearColParallelMerged(
             config.hidden_size, [nqo * head_dim], has_bias=False, quant_method=_method("q_proj")
         )
@@ -144,9 +142,7 @@ class MuseGlimmerAttention(BaseOP):
 
     def post_load(self) -> None:
         super().post_load()
-        # q, k, v and the output gate all read the input-norm output: ONE NVFP4 call over their
-        # stacked op-layout tensors (layers/same_input_gemv.py) instead of four GEMVs, each of
-        # which also re-quantised the same activation row.
+        # q, k, v and the output gate read the same row: one fused call.
         from minisgl.layers.same_input_gemv import fuse_same_input
 
         self._qkvg_fused = fuse_same_input(

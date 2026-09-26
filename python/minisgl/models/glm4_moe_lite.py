@@ -110,10 +110,7 @@ class GLMMLAAttention(BaseOP):
         w = self.kv_b_proj.weight.view(H, self.qk_nope + self.v_head_dim, kv_lora)
         self._w_uk = w[:, : self.qk_nope, :].contiguous()  # [H, qk_nope, kv_lora]
         self._w_uv = w[:, self.qk_nope :, :].contiguous()  # [H, v_head_dim, kv_lora]
-        # q_a_proj and kv_a_proj_with_mqa both read x (replicated bf16): ONE decode GEMV
-        # (layers/same_input_gemv.py). Their consumers already make contiguous copies of the kv
-        # slices; the q_a slice costs one more (its RMSNorm takes a contiguous row), which is still
-        # cheaper than the GEMV launch it replaces.
+        # q_a_proj and kv_a_proj_with_mqa read the same x: one decode GEMV.
         from minisgl.layers.same_input_gemv import fuse_same_input
 
         self._qa_kv_fused = fuse_same_input("glm.mla.q_a+kv_a", (self.q_a_proj, self.kv_a_proj_with_mqa))

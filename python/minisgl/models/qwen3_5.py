@@ -164,9 +164,7 @@ class Qwen3_5Attn(BaseOP):
     @nvtx_annotate("MHA_gated")
     def post_load(self) -> None:
         super().post_load()
-        # q (with its interleaved per-head gate), k and v read the same row: ONE decode GEMV when
-        # all three are unquantised (layers/same_input_gemv.py). The gate interleave lives inside
-        # q's rows, so stacking [q|gate, k, v] on the output dim leaves it intact.
+        # q (with its per-head gate), k and v read the same row: one fused call.
         from minisgl.layers.same_input_gemv import fuse_same_input
 
         self._qkv_fused = fuse_same_input("qwen3_5.attn.q+k+v", (self.q_proj, self.k_proj, self.v_proj))

@@ -1,27 +1,10 @@
 """Several linears over the SAME input, run as ONE GEMV/GEMM — unquantised or quantised.
 
-WHY. On this box a decode GEMV launch costs a fixed ~5 us plus ~3.5 us of dead time between
-graph-replayed kernels, so k small GEMVs over one input row cost far more than one GEMV k times as
-wide — Gemma-4's q/k/v measured 23.1 us as three launches vs 14.2 us merged (rdna4 b934f811).
-
-HOW, without touching a loader. The members keep their own parameters, names and TP layout; after
-load their weights are concatenated ONCE into one (sum N_i, K) buffer and each member's `weight`
-is re-pointed at its row slice of it. So the state dict, the checkpoint keys, the sharding and the
-weight bytes are all unchanged, and every other path that reads `member.weight` (prefill, CAM's
-differentiable F.linear, a debug dump) sees the same tensor it always did. Decode rows (M <= 16)
-then run one `dense_bf16_gemv` over the buffer and hand back column views; anything else runs the
-members exactly as before.
-
-WHAT QUALIFIES, and why each condition. All members must be UNQUANTISED 16-bit dense weights with no
-bias, the same K, dtype and device: the fused call is the same `dense_bf16_gemv` each member's own
-decode path already ends in (UnquantizedLinearMethod -> minv_linear -> dense_bf16_gemv, and
-gdn._GemvLinear -> dense_bf16_gemv), so the fusion changes the launch count and nothing else. A
-quantised member, a mixed set (e.g. a checkpoint that quantises in_proj_qkvz but leaves in_proj_ba
-bf16), or a member with a bias keeps the separate calls — `build` returns None and says why once.
-
-NUMERICS. Each output column is a per-(row, col) fp32 dot in a fixed K order (M-invariant), but the
-tiling table keys its split-K choice on the GEMV's N, so the merged call may associate a column's K
-sum differently from the member's own call — last-ulp, and identical at every M.
+Built in post_load. Unquantised members: weights are concatenated into one buffer and each member's
+`weight` becomes a row view of it (state dict, sharding and bytes unchanged); decode rows (M <= 16)
+run one dense_bf16_gemv and get column views back, larger M runs the members as before.
+Quantised members: see SameInputQuantLinear. Sets that do not qualify (mixed formats, biases,
+differing K) stay separate and are logged once.
 """
 from __future__ import annotations
 
@@ -141,15 +124,11 @@ class _MergedLayer:
 
 
 class SameInputQuantLinear:
-    """Quantised members run as ONE method.apply over their stacked op-layout tensors, at EVERY M.
+    """Quantised members run as ONE method.apply over their stacked op-layout tensors, at every M.
 
-    Unlike the bf16 form, the members cannot keep zero-copy views: a group-major scale plane stacks
-    on dim 1, so a member's slice of it is not contiguous and no kernel takes it. Keeping both copies
-    would double the weight bytes of every fused site (~750 MB/rank on Muse-Glimmer's attention),
-    so the members' op tensors are FREED and the merged layer serves prefill as well as decode. A
-    member called directly afterwards raises AttributeError on its missing op tensor — loudly, never
-    a stale copy. Output columns are independent, so the split outputs are the members' outputs;
-    a different N may pick a different tile (last-ulp), as with any shape change.
+    A group-major scale plane stacks on dim 1, so a member's slice is not contiguous: the members'
+    op tensors are freed and the merged layer serves prefill too. A member used directly afterwards
+    raises (missing op tensor) rather than running a stale copy.
     """
 
     def __init__(self, name: str, method, merged: _MergedLayer, sizes: List[int]):

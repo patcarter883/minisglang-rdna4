@@ -125,12 +125,8 @@ class Gemma4Attention(BaseOP):
                 q, quantized=q is not None and q.is_module_quantized(name)
             )
 
-        # q, k (and v on the sliding layers) in ONE merged projection: the checkpoint ships them
-        # apart, the loader stacks each rank's shards (weight.py `_gemma4_qkv_merge`). One decode
-        # GEMV instead of three — the three shared the same input row, so apart they paid three
-        # launches and three passes of fixed per-call cost for one input read's worth of work.
-        # A full layer ships NO v_proj (`attention_k_eq_v`): its merge is [q | k], and building a v
-        # slice would fail the loader's exact-key check — the absence IS the architecture signal.
+        # One projection for q|k|v (q|k on full layers, which have no v_proj); the loader stacks
+        # each rank's shards (weight.py `_gemma4_qkv_merge`).
         quantized = {m: q is not None and q.is_module_quantized(f"{prefix}.{m}")
                      for m in (("q_proj", "k_proj", "v_proj") if plan.has_v_proj else ("q_proj", "k_proj"))}
         if len(set(quantized.values())) != 1:
@@ -377,13 +373,9 @@ class Gemma4DecoderLayer(BaseOP):
         h, h_fp8, h_scales = self.input_layernorm.forward_quant(x)
         h = self.self_attn.forward(h, h_fp8, h_scales)
         if self._fused_ok(h):
-            # FUSED (tail_hip): the post-attention norm, the residual add, and all three normalized
-            # views the FFN half reads — the dense pre-norm, the MoE pre-norm and the router's scaled
-            # unweighted norm — in ONE pass instead of seven launches; and below, routing in one
-            # kernel after the router GEMM, and the whole combine in one. A bs=1 decode issued 1712
-            # kernels/token against vLLM's 766 on the same cards, at ~3.5 us of graph-replay dead time
-            # per kernel boundary. Bit-identical to the chain (tail/tests/test_gemma4_fusions.py)
-            # except the ordering of exactly-tied experts.
+            # Fused: post-attention norm + residual add + the three FFN input norms in one kernel;
+            # routing and the combine are likewise one kernel each. Bit-identical to the chain
+            # except the order of exactly-tied experts.
             h, n_dense, n_moe, n_router = _tail_hip.gemma4_attn_tail(
                 h.contiguous(), residual.contiguous(), self.post_attention_layernorm.weight,
                 self.pre_feedforward_layernorm.weight, self.pre_feedforward_layernorm_2.weight,

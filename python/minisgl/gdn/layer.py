@@ -274,8 +274,7 @@ class QwenGatedDeltaNet(nn.Module):
 
     # ---- input projections: qkvz and ba read the SAME hidden row ----
     def fuse_input_projections(self) -> None:
-        """After load: run in_proj_qkvz + in_proj_ba as ONE decode GEMV when both are unquantised
-        (layers/same_input_gemv.py). A checkpoint that quantises one and not the other keeps two."""
+        """Fuse in_proj_qkvz + in_proj_ba into one call where their formats allow it."""
         from minisgl.layers.same_input_gemv import fuse_same_input
 
         self._qkvz_ba = fuse_same_input("gdn.in_proj_qkvz+ba", (self.in_proj_qkvz, self.in_proj_ba))
