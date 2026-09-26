@@ -2973,6 +2973,10 @@ def _shard_muse_glimmer(name: str, t: torch.Tensor, r: int, n: int) -> torch.Ten
     if any(s in name for s in (".q_proj.", ".k_proj.", ".v_proj.", ".gate_proj.", ".up_proj.")):
         return t.chunk(n, dim=0)[r].clone()
     if ".o_proj." in name or ".down_proj." in name:
+        # A row-parallel layer splits K, not N, so the NVFP4 per-OUTPUT-channel global (N,) is
+        # whole on every rank — `chunk(dim=1)` on a 1-D tensor would raise.
+        if t.dim() == 1:
+            return t
         return t.chunk(n, dim=1)[r].clone()
     if name.endswith("embed_tokens.weight") or name == "lm_head.weight":
         num_emb = t.shape[0]
@@ -3005,11 +3009,13 @@ def _load_muse_glimmer_weight(
                 # through still 4-bit; input_global_scale (the FP4 activation calibration) is
                 # dropped, because the e2m1 kernel quantizes activations to fp8 dynamically.
                 #
-                # Muse-Glimmer is DENSE, so `nvfp4_leaf_scales` always takes its FOLD arm here and
-                # this loader can only ever see one leaf per pair — asserted rather than assumed, so
-                # that adding an `.experts.` module to this family (which would start splitting) is a
-                # loud failure here instead of a global vector silently dropped on the floor.
-                override = None
+                # NVFP4 is served NATIVE two-level (FORMAT_MATRIX.md G14): `nvfp4_leaf_scales`
+                # returns the e4m3 block scale AND the per-output-channel f32 global for every
+                # module, and each leaf goes through the same remap -> TP shard -> gate/up merge
+                # path below (the global is an N-vector, so it needs no special case there). This
+                # loader used to assert ONE leaf — true only while dense modules were folded — and
+                # so could not boot at all once the dense cores took the native form.
+                leaves = [(name, None)]
                 if _is_nvfp4:
                     if name.endswith(".input_global_scale"):
                         continue
@@ -3026,30 +3032,25 @@ def _load_muse_glimmer_weight(
                             buf["weight_global_scale"],
                             global_field="weight_global_scale",
                         )
-                        assert len(leaves) == 1, (
-                            f"{base}: Muse-Glimmer is dense, but nvfp4_leaf_scales returned "
-                            f"{len(leaves)} leaves ({[n for n, _ in leaves]}). This loader has no "
-                            f"expert stack to carry a per-output-channel global through."
-                        )
-                        name, override = leaves[0]
-                native = _muse_glimmer_remap(name)
-                if native is None:
-                    continue
-                tens = override if override is not None else f.get_tensor(name)
-                tens = _shard_muse_glimmer(native, tens, tp_info.rank, tp_info.size)
-                if (mm := _muse_gate_up_merge(native)) is not None:
-                    merged_key, slot = mm
-                    merge_buf.setdefault(merged_key, {})[slot] = tens
-                    if len(merge_buf[merged_key]) != 2:
+                for leaf_name, override in leaves:
+                    native = _muse_glimmer_remap(leaf_name)
+                    if native is None:
                         continue
-                    parts = [merge_buf[merged_key][s] for s in ("gate", "up")]
-                    del merge_buf[merged_key]
-                    # Both the packed weight (N, K//2) and its group scale (N, K//16) concat on
-                    # dim 0: the gate/up merge stacks OUTPUT rows, the axis neither tensor packs
-                    # along, so the scale stays row-aligned with the weight it describes.
-                    yield merged_key, torch.cat(parts, dim=0)
-                else:
-                    yield native, tens
+                    tens = override if override is not None else f.get_tensor(leaf_name)
+                    tens = _shard_muse_glimmer(native, tens, tp_info.rank, tp_info.size)
+                    if (mm := _muse_gate_up_merge(native)) is not None:
+                        merged_key, slot = mm
+                        merge_buf.setdefault(merged_key, {})[slot] = tens
+                        if len(merge_buf[merged_key]) != 2:
+                            continue
+                        parts = [merge_buf[merged_key][s] for s in ("gate", "up")]
+                        del merge_buf[merged_key]
+                        # Every leaf — packed weight (N, K//2), block scale (N, K//16), global (N,) —
+                        # concats on dim 0: the gate/up merge stacks OUTPUT rows, the axis none of
+                        # them packs along, so each stays row-aligned with the weight it describes.
+                        yield merged_key, torch.cat(parts, dim=0)
+                    else:
+                        yield native, tens
     assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
     assert not nvfp4_fold_buf, f"incomplete NVFP4 scale/global pairs: {list(nvfp4_fold_buf.keys())}"
 
