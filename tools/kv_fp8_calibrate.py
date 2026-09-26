@@ -221,7 +221,7 @@ def _rank_main(rank: int, args, result_q) -> None:
                 )
             else:
                 print(
-                    f"  pool {name}: {pool.num_layers}L x {mc.num_kv_heads}H (global) — "
+                    f"  pool {name}: {pool.num_layers}L x {heads}H (global) — "
                     f"K amax [{ka.min():.4g}, {ka.max():.4g}], V amax [{va.min():.4g}, {va.max():.4g}], "
                     f"per-head spread K median {kspread.median():.2f}x max {kspread.max():.2f}x, "
                     f"V median {vspread.median():.2f}x max {vspread.max():.2f}x"

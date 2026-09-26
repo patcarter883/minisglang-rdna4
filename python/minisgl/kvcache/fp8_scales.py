@@ -351,8 +351,11 @@ def install_kv_fp8_scales(
         "swa": model_config.swa_layer_ids,
     }
 
-    global_heads = model_config.num_kv_heads
+    # The sliding pool has its own kv-head count on a split-geometry model (Gemma-4: 8 vs 2).
+    heads = {None: model_config.num_kv_heads,
+             "swa": getattr(model_config, "swa_num_kv_heads", None) or model_config.num_kv_heads}
     for pool, tag in pools:
+        global_heads = heads[tag]
         ids = layer_map[tag]
         assert len(ids) == pool.num_layers, (
             f"fp8-KV scale install: pool has {pool.num_layers} layers but the config maps "
