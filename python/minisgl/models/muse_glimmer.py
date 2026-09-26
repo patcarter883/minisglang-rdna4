@@ -101,8 +101,9 @@ class MuseGlimmerAttention(BaseOP):
             name = f"{prefix}.{module}"
             return create_linear_method(q, quantized=q is not None and q.is_module_quantized(name))
 
-        # q/k/v stay SEPARATE (the checkpoint ships them apart, and merging them would have to
-        # interleave the NVFP4 group scales too).
+        # The checkpoint ships q/k/v/gate apart; post_load runs them as ONE call (see there). The
+        # NVFP4 block scales are per (output row, K-group), so an output-dim stack of the four is
+        # just a concat of their scale planes — nothing interleaves.
         self.q_proj = LinearColParallelMerged(
             config.hidden_size, [nqo * head_dim], has_bias=False, quant_method=_method("q_proj")
         )
@@ -141,12 +142,22 @@ class MuseGlimmerAttention(BaseOP):
         self._attn_dim_local = div_even(nqo, get_tp_info().size) * head_dim
         self.plan = plan
 
+    def post_load(self) -> None:
+        super().post_load()
+        # q, k, v and the output gate all read the input-norm output: ONE NVFP4 call over their
+        # stacked op-layout tensors (layers/same_input_gemv.py) instead of four GEMVs, each of
+        # which also re-quantised the same activation row.
+        from minisgl.layers.same_input_gemv import fuse_same_input
+
+        self._qkvg_fused = fuse_same_input(
+            "muse.attn.q+k+v+gate", (self.q_proj, self.k_proj, self.v_proj, self.gate_proj))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q = self.q_proj.forward(x)
-        k = self.k_proj.forward(x)
-        v = self.v_proj.forward(x)
+        fused = getattr(self, "_qkvg_fused", None)
+        sep = lambda h: [self.q_proj.forward(h), self.k_proj.forward(h), self.v_proj.forward(h),  # noqa: E731
+                         self.gate_proj.forward(h)]
         # [4] The gate reads the LAYER INPUT (the input_layernorm output), not the attention result.
-        gate = self.gate_proj.forward(x)
+        q, k, v, gate = fused.forward(x, sep) if fused is not None else sep(x)
         o = self.attn.forward_qkv(q, k, v)
         # sigmoid in fp32 then cast back, matching the reference's `torch.sigmoid` on an fp32-upcast
         # activation; applied elementwise to the concatenated head outputs BEFORE o_proj.

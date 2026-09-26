@@ -167,9 +167,9 @@ class Qwen3_5Attn(BaseOP):
         # q (with its interleaved per-head gate), k and v read the same row: ONE decode GEMV when
         # all three are unquantised (layers/same_input_gemv.py). The gate interleave lives inside
         # q's rows, so stacking [q|gate, k, v] on the output dim leaves it intact.
-        from minisgl.layers.same_input_gemv import SameInputGemv
+        from minisgl.layers.same_input_gemv import fuse_same_input
 
-        self._qkv_fused = SameInputGemv.build("qwen3_5.attn.q+k+v", (self.q_proj, self.k_proj, self.v_proj))
+        self._qkv_fused = fuse_same_input("qwen3_5.attn.q+k+v", (self.q_proj, self.k_proj, self.v_proj))
 
     def _qkv(self, x: torch.Tensor):
         fused = getattr(self, "_qkv_fused", None)

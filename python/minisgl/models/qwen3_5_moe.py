@@ -104,9 +104,9 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         super().post_load()
         # The router and the shared-expert gate read the same row and are both replicated bf16:
         # ONE decode GEMV (layers/same_input_gemv.py) instead of a 256-wide and a 1-wide launch.
-        from minisgl.layers.same_input_gemv import SameInputGemv
+        from minisgl.layers.same_input_gemv import fuse_same_input
 
-        self._gates_fused = SameInputGemv.build(
+        self._gates_fused = fuse_same_input(
             "qwen3_5_moe.router+shared_expert_gate", (self.gate, self.shared_expert_gate))
 
     def _gates(self, h: torch.Tensor):

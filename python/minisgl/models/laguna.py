@@ -160,9 +160,9 @@ class LagunaAttention(BaseOP):
         # q, k, v and the per-head gate read the same row: ONE decode GEMV when all four are
         # unquantised (layers/same_input_gemv.py), handed to the attention as views — which also
         # retires the torch.cat that used to re-pack q/k/v just for AttentionLayer to split them.
-        from minisgl.layers.same_input_gemv import SameInputGemv
+        from minisgl.layers.same_input_gemv import fuse_same_input
 
-        self._qkvg_fused = SameInputGemv.build(
+        self._qkvg_fused = fuse_same_input(
             "laguna.attn.q+k+v+g", (self.q_proj, self.k_proj, self.v_proj, self.g_proj))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

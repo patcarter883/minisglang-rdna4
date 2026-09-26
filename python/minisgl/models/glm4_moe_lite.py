@@ -110,6 +110,18 @@ class GLMMLAAttention(BaseOP):
         w = self.kv_b_proj.weight.view(H, self.qk_nope + self.v_head_dim, kv_lora)
         self._w_uk = w[:, : self.qk_nope, :].contiguous()  # [H, qk_nope, kv_lora]
         self._w_uv = w[:, self.qk_nope :, :].contiguous()  # [H, v_head_dim, kv_lora]
+        # q_a_proj and kv_a_proj_with_mqa both read x (replicated bf16): ONE decode GEMV
+        # (layers/same_input_gemv.py). Their consumers already make contiguous copies of the kv
+        # slices; the q_a slice costs one more (its RMSNorm takes a contiguous row), which is still
+        # cheaper than the GEMV launch it replaces.
+        from minisgl.layers.same_input_gemv import fuse_same_input
+
+        self._qa_kv_fused = fuse_same_input("glm.mla.q_a+kv_a", (self.q_a_proj, self.kv_a_proj_with_mqa))
+
+    def _qa_kv(self, x: torch.Tensor):
+        fused = getattr(self, "_qa_kv_fused", None)
+        sep = lambda h: [self.q_a_proj.forward(h), self.kv_a_proj_with_mqa.forward(h)]  # noqa: E731
+        return fused.forward(x, sep) if fused is not None else sep(x)
         # NB: the two einsums below stay on rocBLAS DELIBERATELY. They are batched-over-heads
         # per-head projections, so the 2-D `minv` seam cannot express them, and the obvious
         # conclusion from the kernel sweep — "Tensile runs them at 7.8% occupancy, our GEMV runs the
@@ -126,11 +138,11 @@ class GLMMLAAttention(BaseOP):
         H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
 
         # ---- projections ----
-        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
+        qa, kv = self._qa_kv(x)  # kv: [T, kv_lora + rope]
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(qa))
         q = q.view(T, H, self.qk_head_dim)
         q_nope, q_rope = q[..., :nope], q[..., nope:]  # [T,H,nope], [T,H,rope]
 
-        kv = self.kv_a_proj_with_mqa.forward(x)  # [T, kv_lora + rope]
         c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())  # [T, kv_lora]
         k_rope = kv[:, self.kv_lora_rank :]  # [T, rope] (shared across heads / MQA)
 
@@ -434,10 +446,10 @@ class GLMMTPAttention(GLMMLAAttention):
         roped k_rope) — the exact rows GLMMLAAttention.forward stores in the target's latent cache."""
         T = x.shape[0]
         H, nope, rope = self.num_heads, self.qk_nope, self.qk_rope
-        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
+        qa, kv = self._qa_kv(x)
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(qa))
         q = q.view(T, H, self.qk_head_dim)
         q_nope, q_rope = q[..., :nope], q[..., nope:]
-        kv = self.kv_a_proj_with_mqa.forward(x)
         c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
         q_rope, k_rope = self.rotary.forward(
             positions, q_rope.reshape(T, H * rope).contiguous(), kv[:, self.kv_lora_rank :].contiguous()
