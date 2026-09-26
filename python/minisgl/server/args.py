@@ -422,7 +422,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         default=ServerArgs.spec_algorithm,
         choices=["none", "ngram", "mtp", "eagle3", "dflash", "tidar"],
         help="Speculative-decoding proposer. 'none' disables it; 'ngram' = prompt-lookup; "
-        "'mtp' = the model's own appended next-token-prediction head (GLM-4.x / Qwen3.5); "
+        "'mtp' = the model's own appended next-token-prediction head (GLM-4.x / Qwen3.5), or a "
+        "separate MTP drafter via --spec-draft-model-path (Gemma-4 assistant); "
         "'eagle3' = a separate EAGLE3 draft checkpoint (--spec-draft-model-path); "
         "'dflash' = a separate DFlash block-diffusion draft checkpoint (--spec-draft-model-path); "
         "'tidar' = self-draft block-diffusion on the target (TiDAR; reads tidar_config.json from the "
@@ -434,8 +435,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=str,
         dest="spec_draft_model_path",
         default=ServerArgs.spec_draft_model_path,
-        help="EAGLE3/DFlash draft checkpoint path (HF repo id or local folder). Required for "
-        "--spec-algorithm eagle3.",
+        help="Draft checkpoint path (HF repo id or local folder): EAGLE3/DFlash, or a Gemma-4 "
+        "assistant for --spec-algorithm mtp. Required for eagle3/dflash.",
     )
     parser.add_argument(
         "--spec-num-draft",

@@ -193,10 +193,18 @@ def make_proposer(spec_config: "SpecConfig", engine=None) -> Proposer:
             ngram_min=spec_config.ngram_min,
         )
     if spec_config.algorithm == "mtp":
+        from .gemma4_assistant import Gemma4AssistantProposer, is_gemma4_assistant
         from .mtp import MTPProposer
 
         if engine is None:
             raise ValueError("the MTP proposer needs the engine (model + device); none was passed")
+        # A separate MTP drafter checkpoint (Gemma-4's assistant); otherwise the target's own head.
+        if is_gemma4_assistant(spec_config.draft_model_path):
+            return Gemma4AssistantProposer(
+                engine=engine,
+                num_draft=spec_config.num_draft,
+                draft_model_path=spec_config.draft_model_path,
+            )
         return MTPProposer(engine=engine, num_draft=spec_config.num_draft)
     if spec_config.algorithm == "eagle3":
         from .draft_model import DraftModelProposer

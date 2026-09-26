@@ -25,7 +25,7 @@ class SpecConfig:
     num_draft: int  # K: draft tokens proposed per step; verify runs K+1 query positions/seq
     ngram_max: int  # largest trailing n-gram window the proposer matches on
     ngram_min: int = 1  # smallest window to fall back to
-    draft_model_path: str | None = None  # EAGLE3/DFlash: the separate draft checkpoint path
+    draft_model_path: str | None = None  # EAGLE3/DFlash/Gemma-4 assistant: separate draft checkpoint
 
     def __post_init__(self) -> None:
         if self.algorithm not in SPEC_ALGORITHMS:

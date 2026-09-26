@@ -57,7 +57,7 @@ PORT="${PORT:-1919}"
 # Per model: the checkpoint, the attention backend it wants, its default spec algorithm + draft
 # length, and (for dflash) the draft checkpoint. `attn=hip` is the canonical served backend; `auto`
 # survives only where a model has not been re-validated on it.
-dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""; tool_format=""
+dflash_draft=""; eagle3_draft=""; mtp_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""; tool_format=""
 # Markovian-RSA per-model defaults. `rsa_ladder=1` maps the request's reasoning_effort onto RSA's
 # (n, k, T) — the only "think harder" dial a standard OpenAI client has. Empty = RSA stays strictly
 # opt-in per request, which is what every arm but ZAYA wants.
@@ -1173,6 +1173,10 @@ for p in files:
                     exit 2
                   fi
                   export MINISGL_PLE_FILES MINISGL_PLE_META_FILES ;;
+  */gemma-4-26B-A4B-it*)
+                  model_id="$MODEL"
+                  # SPEC=mtp drafts with Google's assistant checkpoint (reads the target's KV cache).
+                  mtp_draft="google/gemma-4-26B-A4B-it-assistant"; k_mtp=3 ;;
   *)              model_id="$MODEL" ;;     # any other HF id or local path, straight through
 esac
 # The ADVERTISED name (/v1/models id): SERVED_NAME= wins, then the table's per-model alias, then
@@ -1266,7 +1270,8 @@ if [[ -n "$need_draft" && -z "$resolved_draft" ]]; then
 fi
 case "$SPEC" in
   none|"") : ;;
-  mtp)     spec_args=(--spec-algorithm mtp    --spec-num-draft "${SPEC_K:-$k_mtp}") ;;
+  mtp)     spec_args=(--spec-algorithm mtp    --spec-num-draft "${SPEC_K:-$k_mtp}")
+           [[ -n "${DRAFT:-$mtp_draft}" ]] && spec_args+=(--spec-draft-model-path "${DRAFT:-$mtp_draft}") ;;
   ngram)   spec_args=(--spec-algorithm ngram  --spec-num-draft "${SPEC_K:-4}") ;;
   tidar)   spec_args=(--spec-algorithm tidar  --spec-num-draft "${SPEC_K:-$k_tidar}") ;;
   eagle3)  spec_args=(--spec-algorithm eagle3 --spec-draft-model-path "$resolved_draft"
