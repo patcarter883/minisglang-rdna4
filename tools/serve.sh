@@ -672,7 +672,7 @@ case "$MODEL" in
   # the advertised name became basename("/root/.cache/huggingface/q4e") = "q4e", along with the
   # catch-all's generic spec/attn defaults instead of this arm's measured ones. An alias-only entry
   # is unreachable from the one UI that launches it.
-  qwen4exp|qwen4-exp|q4e|/model|*/q4e|*/hf-q4e)
+  qwen4exp|qwen4-exp|q4e|/model|*/q4e|*/q4e-*|*/hf-q4e)
                   # A local checkpoint, not an HF id: the expert stacks ship as per-layer shard
                   # files and the n-gram table is a separate 49 GiB sidecar. The measured runs
                   # mounted /home/pat/.cache/hf-q4e at /model and /home/pat/.cache/hf-ple at /ple.
