@@ -4,11 +4,15 @@ target's KV cache instead of keeping its own (models/gemma4_assistant.py).
 Per request, step 0 feeds (the confirmed token, the target's hidden at the position before it); step
 j feeds (draft j-1, the drafter's projected hidden). Every step queries from position L-1 over the
 target's keys [0, L), L = req.cached_len, so there is no draft-side state to seed, roll back or free.
+
+Sampled requests draft by SAMPLING from the drafter's own distribution q = softmax(logits / T) (Gumbel
+max over each rank's vocab shard) and hand q to the rejection verify, so acceptance is min(1, p/q)
+instead of p(draft). Greedy and grammar-constrained requests draft by argmax (q = onehot).
 """
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -114,6 +118,21 @@ class Gemma4AssistantProposer(CapturableProposer):
         self._g_swa_bt = torch.zeros(G, self._W, dtype=torch.int32, device=dev)
         self._g_swa_len = torch.ones(G, dtype=torch.int32, device=dev)
         self._cols = torch.arange(self._W, dtype=torch.int64, device=dev)
+        # Sampled drafting: per-row 1/T (1 for argmax rows), per-step Gumbel noise over this rank's
+        # vocab shard (0 for argmax rows), and each step's local logits for building q afterwards.
+        head = self._draft.lm_head
+        self._shard = int(head.vocab_range[1])
+        self._g_inv_t = torch.ones(G, 1, dtype=torch.float32, device=dev)
+        self._g_noise = torch.zeros(G, self._num_draft, self._shard, dtype=torch.float32, device=dev)
+        self._g_qlog = torch.zeros(G, self._num_draft, self._shard, dtype=torch.float32, device=dev)
+        # Distinct per rank: each rank's noise covers different vocab ids, and equal seeds would give
+        # id v and id v + shard identical noise, biasing the sample.
+        from minisgl.distributed import get_tp_info
+        self._gen = torch.Generator(device=dev)
+        self._gen.manual_seed(0x6A4A + get_tp_info().rank)
+        self._sampled_rows: List[int] = []
+        self._temps: List[float] = []
+        self._draft_q: Dict[int, torch.Tensor] = {}
         self.init_propose_capture_state(engine, tag="Gemma4-assistant")
         logger.info_rank0(
             f"spec-decode: Gemma-4 assistant drafter ({len(self._draft.layers)} layers, hidden "
@@ -124,7 +143,8 @@ class Gemma4AssistantProposer(CapturableProposer):
     def stage_propose(
         self, reqs: List["Req"], num_draft: int, ctx: ProposeContext, **kw
     ) -> Optional[StagedPropose]:
-        rows, budget, seeds, tbl, lens, toks = [], [], [], [], [], []
+        rows, budget, seeds, tbl, lens, toks, temps = [], [], [], [], [], [], []
+        self._draft_q = {}
         for i, req in enumerate(reqs):
             k_i = max(0, min(num_draft, req.remain_len - 1))
             seed = ctx.last_hidden.get(req.uid) if ctx.last_hidden else None
@@ -136,6 +156,9 @@ class Gemma4AssistantProposer(CapturableProposer):
             tbl.append(int(req.table_idx))
             lens.append(int(req.cached_len))
             toks.append(int(req.input_ids[req.cached_len]))
+            sp = req.sampling_params
+            # Only rows the scheduler verifies with verify_sampled(q=...) may draft from q.
+            temps.append(0.0 if (sp.is_greedy or sp.is_constrained) else float(sp.temperature))
         if not rows:
             return None
         B = len(rows)
@@ -146,6 +169,14 @@ class Gemma4AssistantProposer(CapturableProposer):
         self._g_tok[:B].copy_(idx[2])
         self._g_pos[:B].copy_(L - 1)
         self._g_seed[:B].copy_(torch.stack(seeds).to(self._g_seed.dtype))
+        self._temps = temps
+        self._sampled_rows = [j for j, t in enumerate(temps) if t > 0.0]
+        self._g_inv_t[:B, 0].copy_(torch.tensor([1.0 / t if t > 0.0 else 1.0 for t in temps]))
+        self._g_noise[:B].zero_()
+        for j in self._sampled_rows:
+            u = self._g_noise[j]
+            u.uniform_(generator=self._gen).clamp_(min=1e-20)
+            u.log_().neg_().log_().neg_()                 # Gumbel(0, 1)
         if self._full is not None:
             gpt = self._engine.page_table
             pages = gpt[t, : self._max_pages * self._ps : self._ps]
@@ -169,6 +200,8 @@ class Gemma4AssistantProposer(CapturableProposer):
         self._g_full_len[bs:bucket].fill_(1)
         self._g_swa_bt[bs:bucket].zero_()
         self._g_swa_len[bs:bucket].fill_(1)
+        self._g_inv_t[bs:bucket].fill_(1.0)
+        self._g_noise[bs:bucket].zero_()
 
     # ------------------------------------------------------------------------ hook: the BODY
     def propose_body(self, bs: int) -> None:
@@ -179,8 +212,14 @@ class Gemma4AssistantProposer(CapturableProposer):
         pos = self._g_pos[:bs]
         tok = self._g_tok[:bs]
         seed = self._g_seed[:bs]
+        head = self._draft.lm_head
+        inv_t = self._g_inv_t[:bs]
         for j in range(self._num_draft):
-            tok, seed = self._draft.step(self._embed(tok), seed, pos, attn, self._decode, self._scale)
+            d, seed = self._draft.hidden_step(self._embed(tok), seed, pos, attn, self._decode,
+                                              self._scale)
+            local = head.logits_local_shard(d)             # [bs, shard] fp32
+            self._g_qlog[:bs, j].copy_(local)
+            tok = head.argmax_from_local(local * inv_t + self._g_noise[:bs, j])
             self._g_out[:bs, j] = tok
 
     # ------------------------------------------------------------------- hook: the ONE host sync
@@ -191,4 +230,15 @@ class Gemma4AssistantProposer(CapturableProposer):
             out[i] = d[:k_i]
             if self._dbg:
                 print(f"[g4a-dbg] uid={reqs[i].uid} k={k_i} draft={out[i]}", flush=True)
+        if self._sampled_rows:
+            # q over the full vocab, identical on every rank (same gathered logits, same softmax).
+            rows = torch.tensor(self._sampled_rows, device=self._device)
+            logits = self._draft.lm_head.gather_local_logits(self._g_qlog[rows])  # [n, K, V]
+            inv_t = self._g_inv_t[rows].unsqueeze(-1)
+            q = torch.softmax(logits * inv_t, dim=-1)
+            for n, j in enumerate(self._sampled_rows):
+                self._draft_q[reqs[staged.rows[j]].uid] = q[n, : staged.budget[j]]
         return out
+
+    def draft_distribution(self, uid: int) -> Optional[torch.Tensor]:
+        return self._draft_q.pop(uid, None)

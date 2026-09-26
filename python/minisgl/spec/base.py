@@ -158,6 +158,12 @@ class Proposer(ABC):
         (or None). Default no-op (n-gram / DFlash own no seedable per-req KV). Only called when
         ``supports_prefill_seed`` and seeding is enabled."""
 
+    def draft_distribution(self, uid: int) -> "Optional[torch.Tensor]":
+        """The [len(drafts), vocab] distribution this step's drafts for `uid` were SAMPLED from, for
+        the rejection verify (acceptance min(1, p/q)). None = the drafts are deterministic (argmax),
+        verified with q = onehot. Consumed once per step."""
+        return None
+
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
         """Roll back any draft-owned state (draft KV / recurrent state) to the accepted prefix.
         Default no-op: n-gram owns no state. MTP/DFlash/EAGLE override to truncate their draft KV."""

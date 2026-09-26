@@ -203,7 +203,21 @@ class ParallelLMHead(VocabParallelEmbedding):
         """Greedy token per row, identical on every TP rank, without gathering the logits: each rank
         reduces its own vocab shard and only (max, index) pairs are exchanged. Ties resolve to the
         lowest vocab id, as a full-row argmax would (shards are in ascending vocab order)."""
-        local = self.logits_local_shard(x)                        # [rows, count] fp32
+        return self.argmax_from_local(self.logits_local_shard(x))
+
+    def gather_local_logits(self, local: torch.Tensor) -> torch.Tensor:
+        """Full-vocab rows from per-rank shards: [..., count] on every rank -> [..., num_embeddings],
+        identical on every rank."""
+        if self.tp_size == 1:
+            return local
+        shp = local.shape
+        parts = self._comm.all_gather(local.reshape(-1, shp[-1]).contiguous())
+        parts = parts.view(self.tp_size, -1, shp[-1]).permute(1, 0, 2).reshape(*shp[:-1], -1)
+        return parts[..., : self.num_embeddings]
+
+    def argmax_from_local(self, local: torch.Tensor) -> torch.Tensor:
+        """`argmax_all_rows` over scores already computed on this rank's shard ([rows, count]), e.g.
+        logits plus Gumbel noise for a sampled draw."""
         val, idx = local.max(dim=-1)
         if self.tp_size == 1:
             return idx

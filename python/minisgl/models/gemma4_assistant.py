@@ -145,18 +145,22 @@ class Gemma4AssistantDraft(BaseOP):
         if sd:
             raise ValueError(f"gemma4_assistant: unexpected checkpoint tensors {sorted(sd)[:8]}")
 
-    def step(self, embed: torch.Tensor, seed: torch.Tensor, pos: torch.Tensor,
-             attn: Tuple[tuple, tuple], decode, scale: float) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One draft step. `embed` is the target's scaled embedding of the input token; `attn` is
-        ((sliding target, block_table, ctx_lens), (full target, block_table, ctx_lens)).
-        Returns (argmax token [n], next seed [n, backbone])."""
+    def hidden_step(self, embed: torch.Tensor, seed: torch.Tensor, pos: torch.Tensor,
+                    attn: Tuple[tuple, tuple], decode, scale: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One draft step up to the head. `embed` is the target's scaled embedding of the input token;
+        `attn` is ((sliding target, block_table, ctx_lens), (full target, block_table, ctx_lens)).
+        Returns (normed hidden [n, hidden] for the lm_head, next seed [n, backbone])."""
         x = self.pre_projection.forward(torch.cat([embed, seed.to(embed.dtype)], dim=-1))
         for t, layer in zip(self.layer_types, self.layers):
             tgt, bt, lens = attn[0] if t == "sliding_attention" else attn[1]
             x = layer.forward(x, pos, tgt, bt, lens, decode, scale)
         d = self.norm.forward(x)
-        tok = self.lm_head.argmax_all_rows(d)
-        return tok, self.post_projection.forward(d)
+        return d, self.post_projection.forward(d)
+
+    def step(self, embed, seed, pos, attn, decode, scale) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Greedy draft step: (argmax token [n], next seed [n, backbone])."""
+        d, nxt = self.hidden_step(embed, seed, pos, attn, decode, scale)
+        return self.lm_head.argmax_all_rows(d), nxt
 
 
 __all__ = ["Gemma4AssistantDraft", "_AttnTarget"]
