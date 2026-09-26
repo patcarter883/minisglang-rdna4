@@ -67,6 +67,20 @@ def _unquantised_weight(member) -> torch.Tensor | None:
     return getattr(member, "weight", None)
 
 
+def _restack(host_parts: List[torch.Tensor], dim: int, device) -> torch.Tensor:
+    """Concatenate parts that were staged to HOST and whose device originals are already freed.
+
+    ORDER MATTERS, and it is the whole point of staging. Concatenating on the device allocates the
+    stacked buffer while the members are still live, so it lands in a FRESH segment, and freeing the
+    members afterwards leaves holes inside the loader's segments — holes the caching allocator keeps
+    reserved (other live tensors share those segments) and that no large allocation can use.
+    Measured on Muse-Glimmer (52 layers of q/k/v/gate NVFP4): torch reserved 11.62 -> 13.60 GiB
+    after post_load, and the KV pool then could not be allocated (or graph capture ran out). Freeing
+    first lets the allocator coalesce the members' adjacent blocks, and the stacked buffer — the
+    same bytes — fits back into that space."""
+    return torch.cat(host_parts, dim=dim).contiguous().to(device)
+
+
 class SameInputGemv:
     """One decode GEMV over the members' concatenated weights. Build with `SameInputGemv.build`."""
 
@@ -94,8 +108,16 @@ class SameInputGemv:
         if why is not None:
             _logger.info_rank0(f"[same-input-gemv] {name}: kept separate ({why})")
             return None
-        merged = torch.cat([w.detach() for w in ws], dim=0).contiguous()
         sizes = [w.shape[0] for w in ws]
+        device = ws[0].device
+        host = [w.detach().cpu() for w in ws]
+        for m in members:                     # free the originals FIRST (see _restack)
+            if isinstance(m, torch.nn.Linear):
+                m.weight.data = torch.empty(0, dtype=host[0].dtype, device=device)
+            else:
+                m.weight = torch.empty(0, dtype=host[0].dtype, device=device)
+        del ws
+        merged = _restack(host, 0, device)
         off = 0
         for m, n in zip(members, sizes):
             view = merged[off:off + n]
@@ -180,19 +202,22 @@ class SameInputQuantLinear:
             if w is None:
                 w = m._w_op
             sizes.append(w.shape[0])
-        for a in present[0]:
+        for a in present[0]:                  # validate EVERYTHING before touching anything
             ts = [getattr(m, a) for m in members]
             d = _stack_dim(a, ts[0])
             if len({(t.dtype, t.dim()) for t in ts}) != 1 or len({t.shape[1 - d] for t in ts if t.dim() == 2}) > 1:
                 return f"{a}: members' layouts are not stackable"
-            setattr(merged, a, torch.cat(ts, dim=d).contiguous())
-        if getattr(members[0], "_w4a16", False):
-            merged._w4a16 = True
-            merged._n_out = sum(sizes)
-        for m in members:
+        device = getattr(members[0], present[0][0]).device
+        host = {a: [getattr(m, a).cpu() for m in members] for a in present[0]}
+        for m in members:                     # free the originals FIRST (see _restack)
             for a in present[0]:
                 delattr(m, a)
             m._fused_into = name
+        for a in present[0]:
+            setattr(merged, a, _restack(host[a], _stack_dim(a, host[a][0]), device))
+        if getattr(members[0], "_w4a16", False):
+            merged._w4a16 = True
+            merged._n_out = sum(sizes)
         return cls(name, methods[0], merged, sizes)
 
     def forward(self, x: torch.Tensor, separate=None, **kw) -> List[torch.Tensor]:
