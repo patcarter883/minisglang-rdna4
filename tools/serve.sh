@@ -842,12 +842,7 @@ case "$MODEL" in
                   # with graphs live and is left as an override, not a default: raising it buys KV
                   # pages the operating point has never needed at CONC=2 and spends the headroom
                   # capture allocates its pool out of. MEM_RATIO=0.96 to try it.
-                  mem_default="0.85"  # [ALL-HOST 2026-09-07] 0.90 left 0.42 GiB free and killed two boots
-                  # today: an RCCL `Failed to CUDA calloc` at 32 MiB and again at 2 MiB, and
-                  # (with capture) an HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION. Two
-                  # different-looking failures, one cause: no VRAM margin. All-host frees
-                  # 7.32 GiB/rank, so 0.85 still yields a 1,350,160-token KV pool — 12.8x what
-                  # 0.90 gave with the device tier. Margin is worth more than the last 5%.
+                  mem_default="0.80"  # prefill chunk 4096 needs the headroom; 0.90 fails RCCL/capture allocations
                   # A CAP, not a default (CONC is already assigned above this case block, so
                   # `${CONC:=2}` would be a silent no-op). GRAPH_BS follows CONC, so this is also
                   # the capture coverage: buckets [1,2] are what was captured and measured, and a
@@ -1064,16 +1059,7 @@ case "$MODEL" in
                   #    the number to re-measure is the captured 16k run at MEM_RATIO 0.90 now that 4b
                   #    is row-tiled (note 2). NOT re-measured — this is a pointer, not a result, and
                   #    GRAPH_BS stays 0 until a measurement lands on this line.
-                  # 2. MAX_PREFILL_LENGTH=2048. It was 1024 as a FEASIBILITY term while stage 4b
-                  #    ran at full CHUNK width; 4b is now ROW-TILED at _ATTN_ROW_TILE
-                  #    (QSA_INDEXER.md §8.1, the structural fix this comment used to point at), so
-                  #    the int64 gather index is one tile instead of `[chunk, 2051]` — 8x less
-                  #    transient — and the prefill peak no longer scales with the chunk.
-                  #    WHY IT MATTERS HERE more than the memory: on an all-host arm the ENTIRE
-                  #    31.9 GiB/rank expert set is re-streamed per CHUNK, so chunk width is what
-                  #    amortises it. Measured at 1024: 81 tok/s prefill, i.e. 4.1 min for a
-                  #    20k-token turn. The tiling is bit-exact vs the untiled form
-                  #    (tests/qsa_4b_rowtile_test.py) because the 4b mapping is per row.
+                  # 2. MAX_PREFILL_LENGTH: see the chunk note at its assignment below.
                   #
                   # --page-size 16 (PAGE_SIZE's default, below) is now a HARD REQUIREMENT rather
                   # than a convention: a compressed index key is addressed by
@@ -1081,48 +1067,11 @@ case "$MODEL" in
                   # that identity holds only when a group of r=4 cannot straddle a page.
                   # `QSAProfile.require_page_size` RAISES on anything else rather than falling back
                   # to a second, untested addressing scheme.
-                  # [PREFILL CHUNK 2026-09-15] 2048 -> 8192. THE CHUNK IS THE PREFILL LEVER ON THIS
-                  # ARM, and the reason is in item 2 above: the ENTIRE 31.9 GiB/rank expert set is
-                  # re-streamed PER CHUNK, so a 20k-token turn at chunk 2048 pays that sweep ten
-                  # times. The file's own measurement: 81 tok/s prefill at chunk 1024 = 4.1 minutes
-                  # for a 20k turn. That is the multi-minute "nothing is happening before prefill"
-                  # the operator kept reporting — it is prefill grinding, not a stall, and the
-                  # `minisgl_running_requests` gauge reads 0 throughout because it counts DECODE.
-                  #
-                  # THE EXPERT CACHE DOES NOT AND CANNOT FIX THIS, which is the obvious objection:
-                  # 512 experts x 42 host layers = 21,504 instances against 1,923 cache slots (8.9%),
-                  # and a prefill chunk routes up to ALL 512 per layer — 12x capacity. It is also
-                  # excluded BY DESIGN: `_admit_ok`'s second-reference rule keeps one-touch prefill
-                  # sweeps out because admitting them measured WORSE (prefill pollution +0.028 LFU
-                  # vs -0.0008 SLRU). The cache is a DECODE structure; prefill is a separate problem
-                  # on the same link.
-                  #
-                  # What held the chunk at 1024, then 2048, was stage 4b's full-CHUNK workspace.
-                  # `b7f9ae3` row-tiled it at _ATTN_ROW_TILE, so the prefill peak no longer scales
-                  # with chunk width and the ceiling moved without anyone raising the value.
-                  # 8192 is the ENGINE's own default and what line ~1161 already anticipates.
-                  # COST, and it is accounted rather than assumed: `_ple_runtime_bytes` is
-                  # subtracted BEFORE the KV pool is sized, so this shrinks KV instead of OOMing —
-                  # two `max_extend_tokens x ple_embed_dim` staging buffers, 0.03 GiB at 2048 ->
-                  # ~0.126 GiB at 8192, taking the pool ~1.18 -> ~1.08 GiB (~206k -> ~189k tokens).
-                  # MEASURED 2026-09-15, AND IT IS WHY THIS SAYS 2048 AGAIN: 8192 OOMs. The line
-                  # above ("raise further only with the prefill ACTIVATION peak measured against the
-                  # ~2.35 GiB slack, which is NOT accounted for") was written and then ignored; the
-                  # boot at 21:01 died in the GDN prefill, not in attention —
-                  #   gdn/layer.py:332 `_output_projection` -> gdn.rmsnorm_gated
-                  #   torch.OutOfMemoryError: tried to allocate 48.00 MiB, 168 MiB free of 15.92 GiB
-                  # on BOTH ranks, taking 4 in-flight requests with it. `b7f9ae3` row-tiled stage
-                  # 4b's ATTENTION workspace, which is what the paragraph above credits — but GDN's
-                  # prefill output projection is a different block and still allocates O(chunk).
-                  # One sibling tiled, the other not, so the ceiling never actually moved.
-                  #
-                  # The expert re-sweep argument above is CORRECT and still stands: prefill measured
-                  # 4.0 tok/s (minisgl_prefill_seconds_total 558.6 s for 2243 tokens) because each
-                  # chunk re-streams the host expert set over PCIe at ~52 MB/s effective. But the
-                  # chunk cannot buy the way out — VRAM runs out first. The fix is to stop the
-                  # kernels reading host memory during prefill (stage a layer's experts to a VRAM
-                  # scratch by DMA, prefetched a layer ahead), not to widen the chunk.
-                  : "${GRAPH_BS:=0}"; : "${MAX_PREFILL_LENGTH:=2048}"
+                  # Prefill chunk 4096: every chunk re-streams the host expert set, so a wider chunk
+                  # amortises it (16k-token prefill 1.2-1.4x faster than 2048). The MoE GEMM's
+                  # workspace scales with the chunk and needs MEM_RATIO 0.80 (above); 8192 OOMs even
+                  # at 0.78.
+                  : "${GRAPH_BS:=0}"; : "${MAX_PREFILL_LENGTH:=4096}"
                   # FLOOR_GIB is a BOX property, not a model property, and it is the one value here
                   # that must NOT be carried to another machine. `[QSA-2026-09-06]` the arena is now
                   # 24.62 x 2 = 49.24 GiB (the 37th host layer; it was 24.12 x 2 = 48.23 at the
