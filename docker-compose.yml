@@ -145,6 +145,7 @@ x-lean-common: &lean-common
     # two tokenizers' hashes into one number. Empty = in-memory only.
     MINISGL_GHOST_ORACLE_DIR: "${MINISGL_GHOST_ORACLE_DIR:-/ghost}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
+    MINISGL_KV_SCALES_DIR: "${MINISGL_KV_SCALES_DIR:-/kv-scales}"
     # Fused HIP top-k/top-p sampler (engine/_sampler_hip.py). Default ON; 0 forces the pure-torch
     # reference sampler — the sampler-correctness A/B arm. Was NOT forwarded here, so setting it at
     # launch silently did nothing (the five-hops trap): the A/B would have run the kernel on both
@@ -843,6 +844,10 @@ services:
       # Verify with `zdb -ddddd <dataset> <inode>` and read dblk; never trust `zfs get recordsize`.
       - ${Q4E_MODEL_DIR:-./models/q4e}:/model:ro
       - ${Q4E_PLE_DIR:-./models/q4e-ple}:/ple:ro
+      # fp8-KV sidecar store (written on a checkpoint's first boot, see serve.sh) and the text it
+      # is calibrated on.
+      - ${KV_SCALES_DIR:-./models/kv-scales}:/kv-scales
+      - ${KV_CALIB_DIR:-./models/kv-calib}:/kv-calib:ro
     environment:
       <<: *lean-env
       MODEL: "${MODEL:-qwen35b-awq}"

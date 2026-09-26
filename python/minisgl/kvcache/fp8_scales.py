@@ -21,7 +21,11 @@ RESOLUTION ORDER (first hit wins):
      per-head amax is a property of the ACTIVATIONS, not of the checkpoint. It is also the ONLY
      source of any scale at all for an MLA (latent) cache, which is installed per LAYER — no
      checkpoint ships a latent-cache scale.
-  b. `<model_dir>/kv_scales.safetensors` — the same sidecar, discovered next to the weights.
+  b. `MINISGL_KV_SCALES_DIR/<store key>/kv_scales.safetensors` — the durable sidecar store, keyed by
+     checkpoint CONTENT (config + weight files), so a re-download or a different mount path of the
+     same checkpoint finds it and a different quantization of the same model does not. serve.sh
+     fills it on the first boot of a checkpoint that has no scales.
+  b'. `<model_dir>/kv_scales.safetensors` — the same sidecar, discovered next to the weights.
   c. The CHECKPOINT'S OWN per-tensor scales: compressed-tensors ships `quantization_config.
      kv_cache_scheme` plus `model.layers.N.self_attn.{k,v}_scale`. Broadcast to every head. This is
      general serving infrastructure — the trigger is the declared `quant_config` + the tensor names,
@@ -174,6 +178,36 @@ def _collect(paths: list[str], source: str) -> KVScaleSet | None:
     return KVScaleSet(scales=scales, source=source, per_head=per_head)
 
 
+STORE_ENV = "MINISGL_KV_SCALES_DIR"
+
+
+def store_key(model_path: str) -> str:
+    """`<model_type>-<hash>` of the checkpoint's config.json and its weight files' names and sizes:
+    stable across mount paths and re-downloads, distinct across quantizations of the same model."""
+    import hashlib
+    import json
+
+    folder = download_hf_weight(model_path)
+    h = hashlib.sha256()
+    cfg_path = os.path.join(folder, "config.json")
+    with open(cfg_path, "rb") as f:
+        raw = f.read()
+    h.update(raw)
+    for p in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
+        if os.path.basename(p) != SIDECAR_NAME:
+            h.update(f"{os.path.basename(p)}:{os.path.getsize(p)};".encode())
+    model_type = re.sub(r"[^A-Za-z0-9_.-]", "_", str(json.loads(raw).get("model_type", "model")))
+    return f"{model_type}-{h.hexdigest()[:12]}"
+
+
+def default_sidecar_path(model_path: str) -> str:
+    """Where a new sidecar goes: the store when MINISGL_KV_SCALES_DIR is set, else next to the weights."""
+    store = os.environ.get(STORE_ENV)
+    if store:
+        return os.path.join(store, store_key(model_path), SIDECAR_NAME)
+    return os.path.join(download_hf_weight(model_path), SIDECAR_NAME)
+
+
 def _sidecar(model_path: str) -> KVScaleSet | None:
     explicit = os.environ.get("MINISGL_KV_FP8_SCALES")
     if explicit:
@@ -184,6 +218,11 @@ def _sidecar(model_path: str) -> KVScaleSet | None:
                 f"Produce one with tools/kv_fp8_calibrate.py, or unset the variable."
             )
         return _collect([path], f"sidecar {path}")
+    store = os.environ.get(STORE_ENV)
+    if store:
+        path = os.path.join(store, store_key(model_path), SIDECAR_NAME)
+        if os.path.isfile(path):
+            return _collect([path], f"sidecar {path}")
     folder = download_hf_weight(model_path)
     path = os.path.join(folder, SIDECAR_NAME)
     if os.path.isfile(path):
@@ -297,7 +336,8 @@ def install_kv_fp8_scales(
             "not a good one: an un-scaled store flushes everything below 2^-9 to zero, which on a "
             "typical V tensor (amax ~0.5) is a few percent of RMS. Fix by either (a) serving a "
             "checkpoint that carries quantization_config.kv_cache_scheme + self_attn.{k,v}_scale, "
-            "or (b) running tools/kv_fp8_calibrate.py to write kv_scales.safetensors next to the "
+            "or (b) running tools/kv_fp8_calibrate.py (serve.sh does this on first boot when "
+            "MINISGL_KV_SCALES_DIR is set) to write kv_scales.safetensors next to the "
             "weights (that path also gives PER-HEAD scales, which no checkpoint does)."
         )
         return

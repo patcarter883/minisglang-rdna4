@@ -1650,4 +1650,21 @@ elif [[ -n "${LD_PRELOAD:-}" ]]; then
   printf '[serve] LD_PRELOAD left as caller set it: %s\n' "$LD_PRELOAD"
 fi
 
+# fp8-KV scales. The first boot of a checkpoint with no scales calibrates it (a separate bf16-cache
+# pass over the calibration text, tools/kv_fp8_calibrate.py) into the MINISGL_KV_SCALES_DIR store;
+# every later boot finds that sidecar and skips this in seconds. If calibration fails the serve runs
+# a bf16 KV cache (half the context) rather than an uncalibrated fp8 one.
+if [[ "${MINISGL_KV_FP8:-1}" != "0" && -n "${MINISGL_KV_SCALES_DIR:-}" && -z "${MINISGL_KV_FP8_SCALES:-}" ]]; then
+  calib=(python "$(dirname "$(readlink -f "$0")")/kv_fp8_calibrate.py" --if-missing
+         --model "$model_id" --tp "$TP" --attn-backend "$ATTN"
+         --text "${KV_CALIB_TEXT:-/kv-calib/kv_calib_v1.txt}"
+         --ctx 1024 --max-chunks 24 --max-running-req 1 --memory-ratio 0.70)
+  [[ -n "$WOFF_DEVICE_GB" ]] && calib+=(--weight-offload-device-gb "$WOFF_DEVICE_GB")
+  [[ -n "$WOFF_HOST_GB" ]] && calib+=(--weight-offload-gb "$WOFF_HOST_GB")
+  if ! "${calib[@]}" >&2; then
+    printf '[serve] fp8-KV: calibration FAILED; serving with a bf16 KV cache instead of uncalibrated fp8\n' >&2
+    export MINISGL_KV_FP8=0
+  fi
+fi
+
 exec "${cmd[@]}"

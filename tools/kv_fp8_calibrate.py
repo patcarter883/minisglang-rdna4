@@ -253,10 +253,10 @@ def _rank_main(rank: int, args, result_q) -> None:
 
     out = args.out
     if out is None:
-        from minisgl.kvcache.fp8_scales import SIDECAR_NAME
-        from minisgl.utils import download_hf_weight
+        from minisgl.kvcache.fp8_scales import default_sidecar_path
 
-        out = os.path.join(download_hf_weight(args.model), SIDECAR_NAME)
+        out = default_sidecar_path(args.model)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     meta = {
         "format": "minisgl-kv-fp8-e4m3",
         "convention": "k_scale is the DEQUANT factor: stored = k / k_scale (amax/448)",
@@ -290,7 +290,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--text", required=True, help="representative text fixture (REQUIRED)")
-    ap.add_argument("--out", default=None, help="sidecar path (default: <model dir>/kv_scales.safetensors)")
+    ap.add_argument("--out", default=None,
+                    help="sidecar path (default: the MINISGL_KV_SCALES_DIR store, else <model dir>/kv_scales.safetensors)")
+    ap.add_argument("--if-missing", action="store_true",
+                    help="do nothing if the engine would already find fp8-KV scales for this model")
     ap.add_argument("--report", default=None, help="write the amax/spread report as JSON here")
     ap.add_argument("--tp", type=int, default=1, help="tensor parallelism (needs a lease of --tp cards)")
     ap.add_argument("--ctx", type=int, default=2048, help="tokens per calibration chunk")
@@ -318,6 +321,14 @@ def main() -> int:
                     help="clamp on the pinned host arena per rank (0 = no clamp)")
     args = ap.parse_args()
 
+    if args.if_missing:
+        from minisgl.kvcache.fp8_scales import resolve_kv_fp8_scales
+
+        found = resolve_kv_fp8_scales(args.model)
+        if found is not None:
+            print(f"fp8-KV scales already present ({found.source}); nothing to calibrate")
+            return 0
+        print(f"fp8-KV: no scales for {args.model}; calibrating (first boot of this checkpoint only)")
     if not os.path.isfile(args.text):
         print(f"FAIL: --text {args.text} is not a file", file=sys.stderr)
         return 2
