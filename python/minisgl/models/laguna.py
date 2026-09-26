@@ -155,14 +155,23 @@ class LagunaAttention(BaseOP):
         self._nqo_local = div_even(nqo, get_tp_info().size)
         self.plan = plan
 
+    def post_load(self) -> None:
+        super().post_load()
+        # q, k, v and the per-head gate read the same row: ONE decode GEMV when all four are
+        # unquantised (layers/same_input_gemv.py), handed to the attention as views — which also
+        # retires the torch.cat that used to re-pack q/k/v just for AttentionLayer to split them.
+        from minisgl.layers.same_input_gemv import SameInputGemv
+
+        self._qkvg_fused = SameInputGemv.build(
+            "laguna.attn.q+k+v+g", (self.q_proj, self.k_proj, self.v_proj, self.g_proj))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         n = x.shape[0]
-        q = self.q_proj.forward(x)
-        k = self.k_proj.forward(x)
-        v = self.v_proj.forward(x)
-        gate = self.g_proj.forward(x)  # [n, nqo_local]
-        qkv = torch.cat([q, k, v], dim=-1)
-        o = self.attn.forward(qkv)  # [n, nqo_local*head_dim]
+        sep = lambda h: [self.q_proj.forward(h), self.k_proj.forward(h), self.v_proj.forward(h),  # noqa: E731
+                         self.g_proj.forward(h)]
+        fused = getattr(self, "_qkvg_fused", None)
+        q, k, v, gate = fused.forward(x, sep) if fused is not None else sep(x)  # gate: [n, nqo_local]
+        o = self.attn.forward_qkv(q, k, v)  # [n, nqo_local*head_dim]
         # Laguna gated attention: per-head SOFTPLUS gate (NOT sigmoid), computed in fp32 then cast,
         # broadcast across head_dim, applied BEFORE o_proj (reference modeling_laguna.py
         # `F.softplus(g_proj(x).float())`). softplus ∈ [0,∞) — sigmoid would wrongly cap the gate at 1.

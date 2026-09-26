@@ -162,17 +162,30 @@ class Qwen3_5Attn(BaseOP):
         self._num_qo_heads = div_even(nqo, get_tp_info().size)
 
     @nvtx_annotate("MHA_gated")
+    def post_load(self) -> None:
+        super().post_load()
+        # q (with its interleaved per-head gate), k and v read the same row: ONE decode GEMV when
+        # all three are unquantised (layers/same_input_gemv.py). The gate interleave lives inside
+        # q's rows, so stacking [q|gate, k, v] on the output dim leaves it intact.
+        from minisgl.layers.same_input_gemv import SameInputGemv
+
+        self._qkv_fused = SameInputGemv.build("qwen3_5.attn.q+k+v", (self.q_proj, self.k_proj, self.v_proj))
+
+    def _qkv(self, x: torch.Tensor):
+        fused = getattr(self, "_qkv_fused", None)
+        sep = lambda h: [self.q_proj.forward(h), self.k_proj.forward(h), self.v_proj.forward(h)]  # noqa: E731
+        return fused.forward(x, sep) if fused is not None else sep(x)
+
     def forward(self, x: torch.Tensor, selection: object | None = None) -> torch.Tensor:
         # `selection` (a QSASelection, Qwen4-Exp only) is threaded through rather than handled by a
         # subclass override, so the dense and sparse forwards are literally the same code above the
         # attention call — see AttentionLayer.forward.
         n = x.shape[0]
         hd = self._head_dim
-        qg = self.q_proj.forward(x).view(n, self._num_qo_heads, 2 * hd)
+        qgf, k, v = self._qkv(x)
+        qg = qgf.view(n, self._num_qo_heads, 2 * hd)
         q = qg[..., :hd]  # [n, heads, hd] view, head stride 2*hd — read in place, never copied
         gate = qg[..., hd:].reshape(n, self._num_qo_heads * hd)
-        k = self.k_proj.forward(x)
-        v = self.v_proj.forward(x)
         # AttentionLayer applies q_norm/k_norm (over head_dim) then partial rotary, then attn.
         o = self.attn.forward_qkv(q, k, v, selection=selection)
         o = o * torch.sigmoid(gate)
@@ -268,6 +281,7 @@ class GDNLinearAttn(BaseOP):
 
     def post_load(self) -> None:  # convert any quantized GDN projection to op layout (bf16: no-op)
         self._gdn.process_quant()
+        self._gdn.fuse_input_projections()
 
 
 class Qwen3_5DecoderLayer(BaseOP):
@@ -534,10 +548,10 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         ACCEPTANCE, the target verifies every token."""
         B = x.shape[0]
         hd, nq, nkv = self._head_dim, self._num_qo_heads, self._num_kv_heads
-        qg = self.q_proj.forward(x).view(B, nq, 2 * hd)
+        qgf, k, v = self._qkv(x)
+        qg = qgf.view(B, nq, 2 * hd)
         gate = qg[..., hd:].reshape(B, nq * hd)
-        k = self.k_proj.forward(x)
-        v = self.v_proj.forward(x).view(B, nkv, hd)
+        v = v.view(B, nkv, hd)
         # The target layer's own front end (q/k norm + partial RoPE), so draft and target agree.
         q, k, _ = self.attn.qk_prep.forward(qg[..., :hd], k, None, positions)
         # Persist this token's k/v into its slot at write_col (dynamic tensor index — capturable).
@@ -567,9 +581,9 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         for k/v storage)."""
         S = x.shape[0]
         hd, nq, nkv = self._head_dim, self._num_qo_heads, self._num_kv_heads
-        qg = self.q_proj.forward(x).view(S, nq, 2 * hd)
-        k = self.k_proj.forward(x)
-        v = self.v_proj.forward(x).view(S, nkv, hd)
+        qgf, k, v = self._qkv(x)
+        qg = qgf.view(S, nq, 2 * hd)
+        v = v.view(S, nkv, hd)
         # gate half unused (only k/v are stored); q is still normed+roped as forward_draft_masked does.
         q, k, _ = self.attn.qk_prep.forward(qg[..., :hd], k, None, positions)
         k = k.view(S, nkv, hd)

@@ -272,6 +272,21 @@ class QwenGatedDeltaNet(nn.Module):
         self._conv_w_fp32: torch.Tensor | None = None
         self._norm_w_fp32: torch.Tensor | None = None
 
+    # ---- input projections: qkvz and ba read the SAME hidden row ----
+    def fuse_input_projections(self) -> None:
+        """After load: run in_proj_qkvz + in_proj_ba as ONE decode GEMV when both are unquantised
+        (layers/same_input_gemv.py). A checkpoint that quantises one and not the other keeps two."""
+        from minisgl.layers.same_input_gemv import SameInputGemv
+
+        self._qkvz_ba = SameInputGemv.build("gdn.in_proj_qkvz+ba", (self.in_proj_qkvz, self.in_proj_ba))
+
+    def _in_proj(self, x: torch.Tensor):
+        fused = getattr(self, "_qkvz_ba", None)
+        if fused is not None:
+            qkvz, ba = fused.forward(x, lambda h: [self.in_proj_qkvz(h), self.in_proj_ba(h)])
+            return qkvz, ba
+        return self.in_proj_qkvz(x), self.in_proj_ba(x)
+
     # ---- input split (non-interleaved Qwen3.5 layout) ----
     def _split_qkvz_ba(self, qkvz: torch.Tensor, ba: torch.Tensor, n: int):
         """qkvz -> (mixed_qkv, z); ba -> (b, a). Mirrors
@@ -343,8 +358,7 @@ class QwenGatedDeltaNet(nn.Module):
         from gdn_hip import autograd as gdn_bwd  # lazy: only the training path needs the wrappers
 
         n = hidden_states.shape[0]
-        qkvz = self.in_proj_qkvz(hidden_states)
-        ba = self.in_proj_ba(hidden_states)
+        qkvz, ba = self._in_proj(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         conv_out = gdn_bwd.causal_conv1d_fwd_train(
             mixed_qkv.contiguous(), self._conv_weights_fp32(), None, 1)  # SiLU
@@ -373,8 +387,7 @@ class QwenGatedDeltaNet(nn.Module):
 
         B, T, _ = hidden_states.shape
         n = B * T
-        qkvz = self.in_proj_qkvz(hidden_states.reshape(n, -1))
-        ba = self.in_proj_ba(hidden_states.reshape(n, -1))
+        qkvz, ba = self._in_proj(hidden_states.reshape(n, -1))
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         conv_out = gdn_bwd.causal_conv1d_batch_train(
             mixed_qkv.reshape(B, T, -1).contiguous(), self._conv_weights_fp32(), None, 1)  # [B,T,conv_dim]
@@ -451,8 +464,7 @@ class QwenGatedDeltaNet(nn.Module):
         import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
         n = hidden_states.shape[0]
-        qkvz = self.in_proj_qkvz(hidden_states)
-        ba = self.in_proj_ba(hidden_states)
+        qkvz, ba = self._in_proj(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         state_idx = state_indices.long()  # int32->int64 once, reused by conv + prefill kernels
         has_init = has_initial_state.to(torch.uint8)  # bool->uint8 once, reused likewise
@@ -550,8 +562,7 @@ class QwenGatedDeltaNet(nn.Module):
         import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
         n = hidden_states.shape[0]
-        qkvz = self.in_proj_qkvz(hidden_states)
-        ba = self.in_proj_ba(hidden_states)
+        qkvz, ba = self._in_proj(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         state_idx = state_indices.long()
         has_init = has_initial_state.to(torch.uint8)
@@ -659,8 +670,7 @@ class QwenGatedDeltaNet(nn.Module):
         import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
         n = hidden_states.shape[0]
-        qkvz = self.in_proj_qkvz(hidden_states)
-        ba = self.in_proj_ba(hidden_states)
+        qkvz, ba = self._in_proj(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         # SSM-NORM PROBE (MINISGL_SSM_NORM_LOG=N, debug): every Nth decode call on layer 0, log the
         # max per-head ||S||_F across active slots. The gdn_hip decode kernels Frobenius-clamp the

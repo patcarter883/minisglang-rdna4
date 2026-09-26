@@ -100,6 +100,25 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         e = self.experts
         return bool(getattr(e._moe_method, "supports_producer_actquant", False)) and not e.enable_ep
 
+    def post_load(self) -> None:
+        super().post_load()
+        # The router and the shared-expert gate read the same row and are both replicated bf16:
+        # ONE decode GEMV (layers/same_input_gemv.py) instead of a 256-wide and a 1-wide launch.
+        from minisgl.layers.same_input_gemv import SameInputGemv
+
+        self._gates_fused = SameInputGemv.build(
+            "qwen3_5_moe.router+shared_expert_gate", (self.gate, self.shared_expert_gate))
+
+    def _gates(self, h: torch.Tensor):
+        """(router_logits, shared_expert_gate logit). The routing kernels take raw logits and want
+        them contiguous, so the fused path pays one tiny copy for the router slice — still cheaper
+        than the N=1 GEMV launch it replaces."""
+        fused = getattr(self, "_gates_fused", None)
+        if fused is None:
+            return self.gate.forward(h), self.shared_expert_gate.forward(h)
+        logits, sg = fused.forward(h, lambda x: [self.gate.forward(x), self.shared_expert_gate.forward(x)])
+        return logits.contiguous(), sg
+
     def _fused_partial(self, hidden_states: torch.Tensor,
                        x_fp8: torch.Tensor | None = None,
                        act_scales: torch.Tensor | None = None) -> torch.Tensor:
@@ -111,8 +130,8 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         the reduce is exact: sum_r(g * shared_r) == g * sum_r(shared_r)."""
         experts = self.experts
         shared_out = self.shared_expert.forward(hidden_states, reduce=False)
-        shared_out = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_out
-        router_logits = self.gate.forward(hidden_states)
+        router_logits, shared_gate = self._gates(hidden_states)
+        shared_out = torch.sigmoid(shared_gate) * shared_out
         routed_out = experts.forward(
             hidden_states=hidden_states, router_logits=router_logits, reduce=False,
             x_fp8=x_fp8, act_scales=act_scales,
@@ -185,8 +204,8 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         )
         # shared_expert_gate is replicated (identical per rank), so gating the local partial before the
         # fused reduce is exact: sum_r(g * shared_r) == g * sum_r(shared_r).
-        shared_out = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_out
-        router_logits = self.gate.forward(hidden_states)
+        router_logits, shared_gate = self._gates(hidden_states)
+        shared_out = torch.sigmoid(shared_gate) * shared_out
         routed_out = experts.forward(
             hidden_states=hidden_states, router_logits=router_logits, reduce=not fuse,
             x_fp8=x_fp8, act_scales=act_scales,
