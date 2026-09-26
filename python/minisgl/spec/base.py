@@ -77,6 +77,7 @@ class Proposer(ABC):
       |----------|------------------|-------------------|-------------------|---------------------|
       | ngram    | none             | no                | None              | nothing             |
       | MTP      | target's head    | yes               | None              | head + 1-layer KV   |
+      | MTP      | Gemma-4 assistant| yes               | None              | trunk (reads target KV) |
       | DFlash   | separate ckpt    | (via aux)         | [N target layers] | trunk + draft KV    |
       | EAGLE3   | separate ckpt    | (via aux)         | [3 target layers] | trunk + draft KV    |
 
@@ -165,6 +166,17 @@ class Proposer(ABC):
     def free(self, uid: int) -> None:
         """Release any per-request draft-owned state (draft KV) for a finished/aborted request.
         Default no-op (n-gram); MTP/DFlash/EAGLE override to drop their persistent per-uid cache."""
+
+
+def draft_reserve_bytes(spec_config: "SpecConfig", tp_size: int, dtype) -> "Optional[int]":
+    """Per-rank bytes a proposer's draft model will allocate, when the proposer can state it exactly
+    from its config. None = the engine falls back to its on-disk-size estimate."""
+    if spec_config.algorithm == "mtp":
+        from .gemma4_assistant import Gemma4AssistantProposer, is_gemma4_assistant
+
+        if is_gemma4_assistant(spec_config.draft_model_path):
+            return Gemma4AssistantProposer.reserve_bytes(spec_config.draft_model_path, tp_size, dtype)
+    return None
 
 
 def make_proposer(spec_config: "SpecConfig", engine=None) -> Proposer:

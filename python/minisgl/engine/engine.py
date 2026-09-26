@@ -1586,6 +1586,12 @@ class Engine:
         draft_path = getattr(sc, "draft_model_path", None) if sc is not None else None
         if not draft_path:
             return 0
+        from minisgl.distributed import get_tp_info
+        from minisgl.spec.base import draft_reserve_bytes
+
+        exact = draft_reserve_bytes(sc, get_tp_info().size, self.dtype)
+        if exact is not None:
+            return exact
         try:
             from minisgl.utils import download_hf_weight
 

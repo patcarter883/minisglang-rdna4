@@ -81,6 +81,7 @@ class Gemma4AssistantProposer(CapturableProposer):
         self._backend = backend
         self._embed = target.model._embed_scaled
 
+        alloc0 = torch.cuda.memory_allocated(self._device)
         with torch.device(self._device):
             self._draft = Gemma4AssistantDraft(hf, types)
         folder = download_hf_weight(draft_model_path)
@@ -96,6 +97,37 @@ class Gemma4AssistantProposer(CapturableProposer):
         self.verify_hidden_size = self._draft.backbone
         self._dbg = os.environ.get("MINISGL_SPEC_DEBUG") in ("2", "3")
         self.init_propose_capture(engine)
+        from minisgl.distributed import get_tp_info
+        used = torch.cuda.memory_allocated(self._device) - alloc0
+        reserved = self.reserve_bytes(draft_model_path, get_tp_info().size, engine.dtype)
+        logger.info_rank0(f"spec-decode: Gemma-4 assistant allocated {used / 2**20:.0f} MiB "
+                          f"(reserved {reserved / 2**20:.0f} MiB incl. {self._RESERVE_MARGIN >> 20} MiB "
+                          f"for graphs and transients)")
+
+    # Transient working set + the captured propose graphs' pool (measured 30 MB for buckets 1/2/4)
+    # + the static propose buffers.
+    _RESERVE_MARGIN = 128 << 20
+
+    @staticmethod
+    def reserve_bytes(draft_model_path: str, tp_size: int, dtype) -> int:
+        """Per-rank bytes the drafter allocates, from its config: q/o and gate/up/down sharded over
+        tp, pre/post_projection replicated, the lm_head vocab-sharded as fp8 + a f32 scale per row."""
+        from minisgl.utils import cached_load_hf_config
+
+        hf = cached_load_hf_config(draft_model_path)
+        text = hf.text_config
+        esz = torch.empty(0, dtype=dtype).element_size()
+        H, B = int(text.hidden_size), int(hf.backbone_hidden_size)
+        nh, inter, vocab = int(text.num_attention_heads), int(text.intermediate_size), int(text.vocab_size)
+        per = getattr(text, "per_layer_config", None)
+        total = 3 * B * H * esz                                         # pre + post projection
+        for i, t in enumerate(text.layer_types):
+            hd = int(per[i].head_dim) if per is not None else int(
+                text.head_dim if t == "sliding_attention" else text.global_head_dim)
+            total += 2 * H * (nh * hd // tp_size) * esz                 # q_proj + o_proj shards
+            total += 3 * H * (inter // tp_size) * esz                   # gate|up + down shards
+        total += (vocab // tp_size) * (H + 4)                           # fp8 head shard + scales
+        return total + Gemma4AssistantProposer._RESERVE_MARGIN
 
     # ------------------------------------------------------------------ hook: buffer allocation
     def init_propose_capture(self, engine) -> None:

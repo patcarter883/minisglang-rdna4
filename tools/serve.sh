@@ -1175,8 +1175,9 @@ for p in files:
                   export MINISGL_PLE_FILES MINISGL_PLE_META_FILES ;;
   */gemma-4-26B-A4B-it*)
                   model_id="$MODEL"
-                  # SPEC=mtp drafts with Google's assistant checkpoint (reads the target's KV cache).
-                  mtp_draft="google/gemma-4-26B-A4B-it-assistant"; k_mtp=3 ;;
+                  # MTP drafts with Google's assistant checkpoint, which reads the target's KV cache.
+                  # K=3 measured best (K=2 wins prose, K=4/6 lose both); SPEC=none to turn it off.
+                  spec_default="mtp"; mtp_draft="google/gemma-4-26B-A4B-it-assistant"; k_mtp=3 ;;
   *)              model_id="$MODEL" ;;     # any other HF id or local path, straight through
 esac
 # The ADVERTISED name (/v1/models id): SERVED_NAME= wins, then the table's per-model alias, then
