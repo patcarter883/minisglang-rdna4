@@ -114,27 +114,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Every piece of this architecture that is NOT implemented yet, with the bring-up-plan step that
-# owns it and the EXACT condition under which the gap becomes observable. Logged once per build by
-# `Qwen4ExpForConditionalGeneration.__init__`. Deleting an entry here is the last step of landing
-# that piece — keep it honest. Every one of these also raises at the point of use; the list is the
-# summary, never the enforcement.
+# What this build does not implement, logged once at build. Each entry also raises at its point of
+# use; delete an entry when its piece lands.
 UNIMPLEMENTED: Tuple[Tuple[str, str], ...] = (
-    (
-        "vision tower (model.visual.*)",
-        "text-only serve, as for every other multimodal checkpoint here. The loader counts the 333 "
-        "skipped vision tensors in its ignore ledger; an image token in a prompt is a tokenizer/"
-        "front-end concern and never reaches this model",
-    ),
-    (
-        "cudagraph capture of the PREFILL / spec-VERIFY forwards",
-        "DECODE capture is implemented and exercised (2026-09-04): boot with the `hip` attention "
-        "backend and --cuda-graph-max-bs > 0, and `PLEGraphCapture` stages the n-gram batch the "
-        "capture-time warmup forward needs. Prefill stays eager everywhere in this engine, and "
-        "spec-verify capture is moot while --spec-algorithm mtp is refused for this architecture. "
-        "The `rdna4` attention backend still raises on capture (its Phase-4 gap, not this model's); "
-        "the capture-capable subclass is `hip`, which is what every production serve here uses",
-    ),
+    ("vision tower", "text-only"),
 )
 
 
@@ -959,10 +942,9 @@ class Qwen4ExpForConditionalGeneration(BaseLLMModel):
             f"qwen4_exp built: {config.num_layers} layers ({len(config.gdn_layer_ids)} GDN + "
             f"{len(config.full_attn_layer_ids)} full-attn), PLE on decoder index "
             f"{sorted(config.ple_layer_ids)}, {config.hc_count}x{config.hidden_size}-wide "
-            f"hyper-connection residual. NOT implemented in this build:"
+            f"hyper-connection residual; not implemented: "
+            + ", ".join(f"{what} ({why})" for what, why in UNIMPLEMENTED)
         )
-        for what, why in UNIMPLEMENTED:
-            logger.info_rank0(f"  * {what}\n      ({why})")
         self._config = config
         self._qsa_built = False
 
