@@ -2001,6 +2001,25 @@ class Engine:
                 # 28.93 GB/s for the pair is wrong by ~2x).
                 + self._woff.kv_annotation()
             )
+            # PHYSICAL CEILING. The budget above is ratio x free-at-start minus what is RESIDENT, so
+            # memory torch holds reserved-but-unallocated after empty_cache() counts as available —
+            # but those are holes inside segments that still hold live blocks (loader transients,
+            # layout conversions and same-input fusion leave them), usable by small activation
+            # tensors and NEVER by the pool, which is one allocation. When the holes exceed the
+            # ratio's headroom the pool is sized past what the device can return: Muse-Glimmer with
+            # its attention fused, 3.11 GiB sized against 3.02 GiB free, OOM at boot on both ranks.
+            # So the pool never exceeds THIS rank's actual free memory (read after the
+            # synchronize + empty_cache above, with nothing allocated since) less a small margin;
+            # `_tp_min_num_pages` below then takes the cross-rank MIN, so every rank can hold it.
+            # (`new_free_memory` is the cross-rank MAX — the wrong side for a ceiling.)
+            _free_ceiling = int(get_free_memory(self.device)) - 256 * 1024 * 1024
+            if available_memory > _free_ceiling:
+                logger.info_rank0(
+                    f"KV sizing: pool clamped to device free memory {mem_GB(available_memory)} -> "
+                    f"{mem_GB(max(_free_ceiling, 0))} ({mem_GB(reserved_now - alloc_now)} of torch "
+                    f"reserved is fragmentation the pool cannot use)"
+                )
+                available_memory = max(_free_ceiling, 0)
             num_pages = available_memory // cache_per_page
             if snap_memory:
                 # Name the snapshot KIND. "recurrent" is conv+ssm / conv+prev_hs clones; "swa" is
