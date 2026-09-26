@@ -1784,6 +1784,27 @@ def w4a16_linear_silu(
     )
 
 
+def w8a16_block_linear(
+    x: torch.Tensor,        # (..., K) bf16/fp16 activations
+    w_fp8: torch.Tensor,    # (N, K) uint8 e4m3 bytes
+    scales: torch.Tensor,   # (K/128, N) f32 group-major K-group plane (a block fp8 scale, expanded)
+) -> torch.Tensor:
+    """Block-scaled fp8 weight x 16-bit activation, native: the SAME dense W8A16 ops the per-channel
+    format uses, which read the scale policy off the scale tensor's shape (2-D = K-group). Decode
+    rows (M <= 16) take the GEMV, anything larger the tiled GEMM."""
+    import fp8_wmma
+
+    shp = x.shape
+    x2 = x.reshape(-1, shp[-1]).contiguous()
+    if x2.shape[0] <= 16:
+        engaged("fp8_wmma.dense_w8a16_gemv[block-fp8]")
+        y = fp8_wmma.dense_w8a16_gemv(x2, w_fp8, scales)
+    else:
+        engaged("fp8_wmma.dense_w8a16_gemm[block-fp8]")
+        y = fp8_wmma.dense_w8a16_gemm(x2, w_fp8, scales)
+    return y.reshape(*shp[:-1], w_fp8.shape[0])
+
+
 def w8a8_dense_linear(
     x: torch.Tensor,  # (M, K) fp16/bf16 activations
     w_fp8: torch.Tensor,  # (N, K) uint8 (e4m3 bits), op layout (natural row-major)

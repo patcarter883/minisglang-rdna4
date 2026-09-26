@@ -699,7 +699,7 @@ def create_linear_method(
     if quant.is_fp8_block:
         # BEFORE is_fp8_w8a8: a blockwise checkpoint satisfies both, and the per-channel method would
         # declare a (N,1) scale where the file ships (N/128, K/128).
-        return Fp8BlockDequantLinearMethod(quant)
+        return Fp8BlockLinearMethod(quant)
     if quant.is_fp8_w8a8:
         return Fp8W8A8LinearMethod(quant)
     return W4A8LinearMethod(quant)
@@ -832,28 +832,24 @@ class NvFp4LinearMethod:
         ).to(x.dtype)
 
 
-class Fp8BlockDequantLinearMethod:
-    """DeepSeek-style BLOCKWISE fp8 (e4m3 weights + a 2-D scale per `block_structure` tile),
-    dequantized to bf16 ONCE at load and then served as an ordinary unquantized linear.
+class Fp8BlockLinearMethod:
+    """DeepSeek-style BLOCKWISE fp8 (e4m3 weights + a 2-D scale per `block_structure` tile), served
+    NATIVELY: the weight stays one byte, the block scale rides the shared W8A16 cores as a K-group
+    scale policy.
 
-    WHY DEQUANTIZE RATHER THAN SERVE IT QUANTIZED. A blockwise scale varies along K as well as N, so
-    unlike the per-output-channel `Fp8W8A8LinearMethod` it cannot fold into the GEMM epilogue, and no
-    kernel in this engine consumes a 2-D weight scale. The options were a new blockwise fp8 kernel or
-    an exact one-time dequantization; the second is chosen because it is EXACT (an fp8 value times its
-    block scale, widened — no second approximation), needs no kernel, and lands the module on
-    `minv_linear`, the same M-invariant chokepoint every other unquantized Linear uses, so a
-    chunked / prefix-cached / spec-verify forward still matches a fresh one bit-for-bit.
+    It used to be dequantized to bf16 at load (the class was `Fp8BlockLinearMethod`), on the
+    premise that no kernel consumes a 2-D weight scale. But a (128 x 128) block scale is a K-GROUP
+    scale repeated down 128 output rows: expanded at load into a group-major (K/128, N) f32 plane it is
+    exactly the kind of scale the decode core already folds per chunk for every 4-bit format. So:
+      * decode (M <= 16): fp8_wmma.dense_w8a16_gemv -> W8A16GroupGemvLoader (scale per 16-k chunk);
+      * prefill: fp8_wmma.dense_w8a16_gemm -> W8A16Group128Loader, which dequantises each weight WITH
+        its scale as it stages into LDS — the same `(w.float() * scale).to(act)` rounding the load-time
+        dequant produced, so prefill arithmetic is unchanged.
+    What that buys on Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ (its attention and GDN projections): ~1.3 GiB
+    per card at TP=2 back to the KV pool / expert cache, and half the bytes those GEMVs read per token.
 
-    THE MEMORY IS AFFORDABLE HERE, which is the only reason this is a reasonable trade. It applies to
-    Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ's attention and GDN projections, and the NVFP4 sibling of that
-    same checkpoint SPARES those modules entirely — i.e. serves them bf16 already, at the same size
-    this produces. The bulk of the model (the routed experts) stays 4-bit either way. Do NOT reach for
-    this method on a checkpoint whose blockwise-fp8 modules are the bulk: there it would double the
-    weight budget and a real blockwise kernel is the answer.
-
-    The declared per-group-128 dynamic fp8 ACTIVATION scheme is deliberately dropped with the weight
-    quantization: once the weight is bf16 there is nothing to pair a quantized activation with, and
-    quantizing x for a bf16 GEMM would be a pure loss. Same reasoning the W4A16 arms use.
+    A block other than 128 along K keeps the exact load-time dequant (the tiled loader's group is a
+    compile-time 128, the one block these checkpoints use) and says so once.
     """
 
     def __init__(self, quant: QuantConfig) -> None:
@@ -879,46 +875,35 @@ class Fp8BlockDequantLinearMethod:
         # checkpoint ships (BF16 [N/128, K/128]).
         layer.weight_scale_inv = torch.empty((N // bn, K // bk), dtype=torch.bfloat16)
 
-    #: Cumulative bytes this method has ADDED to the weight budget on this rank by widening fp8 to
-    #: bf16, and the next 1 GiB boundary to report at. A module-level tally rather than a return value
-    #: because the cost is only meaningful summed over the whole model, and it must not be invisible:
-    #: on Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ it is ~1.25 GiB per card at TP=2, the single largest VRAM
-    #: item this method introduces, and a weight-format decision whose second site is the arena sizing.
-    _added_bytes: int = 0
-    _next_report: int = 1 << 30
+    def _native(self) -> bool:
+        return int(self.quant.block_structure[-1]) == 128
 
     def process_weights_after_load(self, layer: "BaseOP") -> None:
         bn, bk = (int(self.quant.block_structure[0]), int(self.quant.block_structure[-1]))
         w = layer.weight
         N, K = w.shape
-        cls = Fp8BlockDequantLinearMethod
-        added = N * K  # fp8 (1 B) -> bf16 (2 B) on this module, minus the freed scale tile (~0)
-        first = cls._added_bytes == 0
-        cls._added_bytes += added
-        if first or cls._added_bytes >= cls._next_report:
-            if cls._added_bytes >= cls._next_report:
-                cls._next_report = ((cls._added_bytes >> 30) + 1) << 30
-            # A DIAGNOSTIC MUST NOT BE ABLE TO BREAK A LOAD. `info_rank0` resolves TP info, which a
-            # CPU-only unit test never sets (`tests/ct_block_fp8_test.py` called this and died on
-            # "TP info has not been set"), so the tally is reported on a best-effort basis and the
-            # dequantization proceeds either way.
-            try:
-                from minisgl.utils import init_logger
+        sc = layer.weight_scale_inv.to(torch.float32)          # (N/bn, K/bk)
+        if self._native():
+            # (N/bn, K/bk) -> repeat each tile's scale down its bn rows -> (N, K/128) -> transpose to
+            # the GROUP-MAJOR (K/128, N) plane the cores index as [g * N + n] (N contiguous, so a
+            # wave's neighbouring columns read neighbouring scales).
+            layer._w_op = w.contiguous().view(torch.uint8)
+            layer._scales_op = sc.repeat_interleave(bn, dim=0)[:N].t().contiguous()
+            del layer.weight, layer.weight_scale_inv
+            return
+        try:
+            from minisgl.utils import init_logger
 
-                init_logger("quant").info_rank0(
-                    f"blockwise-fp8: dequantized to bf16 at load, "
-                    f"+{cls._added_bytes / (1 << 20):.0f} MiB on this rank so far "
-                    f"(latest module {N}x{K}, +{added / (1 << 20):.1f} MiB). This is EXACT and lands "
-                    f"on minv_linear, but it is a real VRAM cost a native blockwise-fp8 GEMM would "
-                    f"not pay — see docs/journal/ENGINE_COMPARISON_2026-09-22.md item 7."
-                )
-            except Exception:  # noqa: BLE001 -- no TP info (CPU test), or logging unavailable
-                pass
+            init_logger("quant").info_rank0(
+                f"blockwise-fp8 block {(bn, bk)}: K-block is not 128, dequantized to bf16 at load "
+                f"({N}x{K}); the native W8A16 cores serve 128-blocks only."
+            )
+        except Exception:  # noqa: BLE001 -- no TP info (CPU test), or logging unavailable
+            pass
         # Expand the tile scale to full (N, K) by repeating each tile value over its block, then
         # multiply in f32 and narrow once. `repeat_interleave` on both axes rather than a broadcast
         # reshape: the reshape spelling only works when N/bn and K/bk tile exactly in that memory
         # order, and getting it wrong transposes the scale field silently.
-        sc = layer.weight_scale_inv.to(torch.float32)
         sc = sc.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)[:N, :K]
         layer.weight = (w.to(torch.float32) * sc).to(torch.bfloat16).contiguous()
         del layer.weight_scale_inv
@@ -926,9 +911,15 @@ class Fp8BlockDequantLinearMethod:
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
-        from minisgl.layers.minv import minv_linear
+        w8 = getattr(layer, "_w_op", None)
+        if w8 is None:                      # the non-128-block fallback: dequantized bf16 weight
+            from minisgl.layers.minv import minv_linear
 
-        return minv_linear(x, layer.weight, bias)
+            return minv_linear(x, layer.weight, bias)
+        out = kernels.w8a16_block_linear(x, w8, layer._scales_op)  # type: ignore[attr-defined]
+        if bias is not None:
+            out = out + bias
+        return out
 
 
 class Fp8W8A8LinearMethod:

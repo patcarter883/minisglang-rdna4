@@ -360,7 +360,7 @@ class QuantConfig:
         Distinct from `is_fp8_w8a8`, which is per-OUTPUT-CHANNEL (one scale per row, `(N,1)`) and
         folds into the GEMM epilogue. A block scale varies along K as well, so it cannot be an
         epilogue factor and no kernel here consumes it — the method dequantizes to bf16 at load
-        instead (see Fp8BlockDequantLinearMethod). Checked BEFORE is_fp8_w8a8 at the dispatch,
+        instead (see Fp8BlockLinearMethod). Checked BEFORE is_fp8_w8a8 at the dispatch,
         because a block checkpoint satisfies both and the channel method would try to load a
         `(N,1)` scale where the file has `(N/128, K/128)`.
         """

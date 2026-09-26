@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import torch
 
 from minisgl.quant.config import QuantConfig
-from minisgl.quant.method import Fp8BlockDequantLinearMethod, create_linear_method
+from minisgl.quant.method import Fp8BlockLinearMethod, create_linear_method
 
 FAILED: list[str] = []
 
@@ -118,10 +118,10 @@ def routing() -> None:
         "model.layers.5.mlp.experts.7.gate_proj": "MxFp4LinearMethod",
         "model.layers.5.mlp.shared_expert.down_proj": "MxFp4LinearMethod",
         # the blockwise-fp8 group — reached only because the catch-all is ordered LAST
-        "model.layers.3.self_attn.q_proj": "Fp8BlockDequantLinearMethod",
-        "model.layers.3.self_attn.o_proj": "Fp8BlockDequantLinearMethod",
-        "model.layers.0.linear_attn.in_proj_qkv": "Fp8BlockDequantLinearMethod",
-        "model.layers.0.linear_attn.out_proj": "Fp8BlockDequantLinearMethod",
+        "model.layers.3.self_attn.q_proj": "Fp8BlockLinearMethod",
+        "model.layers.3.self_attn.o_proj": "Fp8BlockLinearMethod",
+        "model.layers.0.linear_attn.in_proj_qkv": "Fp8BlockLinearMethod",
+        "model.layers.0.linear_attn.out_proj": "Fp8BlockLinearMethod",
         # the ignore list still wins over both
         "model.layers.0.linear_attn.in_proj_a": "UNQUANTIZED",
         "model.layers.5.mlp.gate": "UNQUANTIZED",
@@ -144,8 +144,20 @@ def declaration_order_preserved() -> None:
           broad in ("NvFp4LinearMethod", "MxFp4LinearMethod"), f"got {broad}")
 
 
-def dequant() -> None:
-    m = Fp8BlockDequantLinearMethod(SimpleNamespace(block_structure=(128, 128)))
+def _tile_ref(w8, sc, bn, bk):
+    """Independent reference: per-element tile lookup. Deliberately not the implementation's
+    expression — a shared `repeat_interleave` spelling would agree with itself even transposed."""
+    N, K = w8.shape
+    ref = torch.empty(N, K, dtype=torch.float32)
+    for i in range(N):
+        for j in range(K):
+            ref[i, j] = w8[i, j].float() * sc[i // bn, j // bk].float()
+    return ref
+
+
+def native() -> None:
+    """128-block: served NATIVE — the fp8 bytes stay, the tile scale becomes a (K/128, N) plane."""
+    m = Fp8BlockLinearMethod(SimpleNamespace(block_structure=(128, 128)))
     layer = SimpleNamespace()
     N, K = 256, 384
     m.create_weights(layer, N, K)
@@ -153,21 +165,39 @@ def dequant() -> None:
     check("declares the DeepSeek scale name at tile shape",
           tuple(layer.weight_scale_inv.shape) == (N // 128, K // 128),
           str(tuple(layer.weight_scale_inv.shape)))
-
     torch.manual_seed(0)
     layer.weight = (torch.randn(N, K) * 0.3).to(torch.float8_e4m3fn)
     layer.weight_scale_inv = (torch.rand(N // 128, K // 128) + 0.5).to(torch.bfloat16)
     w8, sc = layer.weight.clone(), layer.weight_scale_inv.clone()
     m.process_weights_after_load(layer)
-    # Independent reference: per-element tile lookup. Deliberately not the same expression as the
-    # implementation — a shared `repeat_interleave` spelling would agree with itself even transposed.
-    ref = torch.empty(N, K, dtype=torch.float32)
-    for i in range(N):
-        for j in range(K):
-            ref[i, j] = w8[i, j].float() * sc[i // 128, j // 128].float()
-    check("dequantized to bf16", layer.weight.dtype == torch.bfloat16)
+    check("weight kept as 1-byte e4m3 (not widened)",
+          layer._w_op.dtype == torch.uint8 and torch.equal(layer._w_op, w8.view(torch.uint8)))
+    check("scale plane is group-major (K/128, N) f32",
+          layer._scales_op.dtype == torch.float32 and tuple(layer._scales_op.shape) == (K // 128, N),
+          str(tuple(layer._scales_op.shape)))
+    # What the cores compute per element: byte * plane[k // 128, n]. It must equal the tile lookup.
+    plane_full = layer._scales_op.t().repeat_interleave(128, dim=1)[:, :K]      # (N, K)
+    served = layer._w_op.view(torch.float8_e4m3fn).float() * plane_full
+    check("plane reproduces the per-element tile scale exactly",
+          torch.equal(served, _tile_ref(w8, sc, 128, 128)))
+    check("checkpoint tensors released after load",
+          not hasattr(layer, "weight") and not hasattr(layer, "weight_scale_inv"))
+
+
+def dequant_fallback() -> None:
+    """A K-block other than 128 keeps the exact load-time dequant (the tiled core's group is 128)."""
+    m = Fp8BlockLinearMethod(SimpleNamespace(block_structure=(128, 64)))
+    layer = SimpleNamespace()
+    N, K = 256, 384
+    m.create_weights(layer, N, K)
+    torch.manual_seed(1)
+    layer.weight = (torch.randn(N, K) * 0.3).to(torch.float8_e4m3fn)
+    layer.weight_scale_inv = (torch.rand(N // 128, K // 64) + 0.5).to(torch.bfloat16)
+    w8, sc = layer.weight.clone(), layer.weight_scale_inv.clone()
+    m.process_weights_after_load(layer)
+    check("non-128 K-block dequantized to bf16", layer.weight.dtype == torch.bfloat16)
     check("bit-exact vs per-element reference",
-          torch.equal(layer.weight.float(), ref.to(torch.bfloat16).float()))
+          torch.equal(layer.weight.float(), _tile_ref(w8, sc, 128, 64).to(torch.bfloat16).float()))
     check("scale released after load", not hasattr(layer, "weight_scale_inv"))
 
     # A TP split that cuts a block must be refused, not silently misaligned.
@@ -186,7 +216,8 @@ def main() -> int:
     print("\nNO REGRESSION for the specific-before-general layout")
     declaration_order_preserved()
     print("\nBLOCK DEQUANTIZATION")
-    dequant()
+    native()
+    dequant_fallback()
     print("\n" + ("all passed" if not FAILED else f"FAILED: {FAILED}"))
     return 1 if FAILED else 0
 
