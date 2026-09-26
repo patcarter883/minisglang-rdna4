@@ -162,10 +162,14 @@ def _rank_main(rank: int, args, result_q) -> None:
         engine = llm.engine
         mc = ModelConfig.from_hf(cached_load_hf_config(args.model))
 
-        pools = [(engine.kv_cache, mc.full_attn_layer_ids, "main")]
+        # (pool, layer ids, name, global kv heads): the sliding pool has its own head count on a
+        # split-geometry model (Gemma-4: 8 sliding vs 2 full).
+        heads_full = 1 if mc.is_mla else mc.num_kv_heads
+        pools = [(engine.kv_cache, mc.full_attn_layer_ids, "main", heads_full)]
         if getattr(engine, "swa_kv_cache", None) is not None:
-            pools.append((engine.swa_kv_cache, mc.swa_layer_ids, "SWA ring"))
-        for pool, _, _ in pools:
+            pools.append((engine.swa_kv_cache, mc.swa_layer_ids, "SWA ring",
+                          getattr(mc, "swa_num_kv_heads", None) or mc.num_kv_heads))
+        for pool, _, _, _ in pools:
             if not getattr(pool, "_calibrating", False):
                 print(
                     "FAIL: KV pool is not accumulating — MINISGL_KV_FP8_CALIBRATE did not take "
@@ -188,12 +192,11 @@ def _rank_main(rank: int, args, result_q) -> None:
         # Gather the shards into GLOBAL per-head rows BEFORE computing any scale: a scale belongs to
         # a (layer, head), so it has to come from that head's own global amax and never from a
         # rank-local reduction.
-        for pool, layer_ids, name in pools:
+        for pool, layer_ids, name, heads in pools:
             assert len(layer_ids) == pool.num_layers, (len(layer_ids), pool.num_layers)
             # An MLA pool accumulates ONE amax per layer (the latent is a single stored tensor with
             # no head axis) and is TP-REPLICATED, so its "global head count" is 1 and the gather
             # reduces with MAX across ranks rather than concatenating shards.
-            heads = 1 if mc.is_mla else mc.num_kv_heads
             ka = _gather_global_amax(
                 pool._k_amax.float().cpu(), llm.tp_cpu_group, rank, tp, heads
             )
@@ -322,7 +325,12 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.if_missing:
+        from minisgl.distributed import set_tp_info
         from minisgl.kvcache.fp8_scales import resolve_kv_fp8_scales
+
+        # The resolver reads checkpoint scale tensors through the TP-aware loaders; this parent
+        # process is not a rank (the ranks are spawned fresh below), so give it a single-rank view.
+        set_tp_info(rank=0, size=1)
 
         found = resolve_kv_fp8_scales(args.model)
         if found is not None:

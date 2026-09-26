@@ -79,6 +79,21 @@ def main() -> int:
                            capture_output=True, text=True, env=env, timeout=300)
         check("--if-missing is a no-op when scales exist",
               r.returncode == 0 and "nothing to calibrate" in r.stdout, (r.stdout + r.stderr)[-200:])
+
+        # A checkpoint that ships k/v scale tensors but no kv_cache_scheme (Flash-Next MXFP4): the
+        # scales are unusable, so --if-missing must go on to calibrate (here it stops at the missing
+        # text, exit 2) — and must get there without needing a TP context of its own.
+        c = make_ckpt(root, "ships-scales", "mxfp4-pack-quantized")
+        save_file({"model.layers.0.mlp.w": torch.zeros(4, 4),
+                   "model.layers.0.self_attn.k_scale": torch.tensor(0.1),
+                   "model.layers.0.self_attn.v_scale": torch.tensor(0.1)},
+                  os.path.join(c, "model.safetensors"))
+        r = subprocess.run([sys.executable, os.path.join(REPO, "tools", "kv_fp8_calibrate.py"),
+                            "--if-missing", "--model", c, "--text", "/nonexistent"],
+                           capture_output=True, text=True, env=env, timeout=300)
+        out = r.stdout + r.stderr
+        check("checkpoint scales without a scheme -> calibrates (no TP error)",
+              r.returncode == 2 and "calibrating" in out and "TP info" not in out, out[-240:])
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("ALL CHECKS PASS" if not FAILED else "FAILED: " + "; ".join(FAILED))
