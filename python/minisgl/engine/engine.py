@@ -375,13 +375,6 @@ class Engine:
                 with _bt.phase("oneshot_post_load"):
                     self.model.post_load()  # finalize weights (quantized layout conversion)
         _mem_probe("after post_load")
-        # post_load FREES tensors — layout conversions drop the checkpoint copies, and same-input
-        # fusion (layers/same_input_gemv.py) drops every member's op tensors once they are stacked.
-        # Those blocks stay in torch's caching allocator as reserved-but-unallocated, fragmented at
-        # per-layer size: KV sizing below counts them as available, but the pool is ONE allocation
-        # that no fragment can hold (Muse-Glimmer: 3.33 GiB reserved-unallocated, a 3.89 GiB pool
-        # OOM'd). Hand them back to the device before anything is sized.
-        torch.cuda.empty_cache()
         # Vision tower: one full-budget encode at boot, so the first image request does not pay for
         # the tower's first kernel launches; its transients are released before KV sizing.
         if getattr(self.model, "vision", None) is not None:
