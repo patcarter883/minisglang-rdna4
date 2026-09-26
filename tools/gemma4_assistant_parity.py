@@ -81,6 +81,7 @@ def main():
     for f in sorted(os.listdir(folder)):
         if f.endswith(".safetensors"):
             sd.update(st.load_file(os.path.join(folder, f), device="cpu"))
+    head_bf16 = sd["model.embed_tokens.weight"].to(DEV, torch.bfloat16)
     ours.load(sd, DEV, torch.bfloat16)
 
     sw_hd, sw_kv = tcfg.swa_head_dim, tcfg.swa_num_kv_heads
@@ -138,6 +139,7 @@ def main():
         # Each step: all three sides get the SAME input (the fp32 reference's token and seed), so
         # every step is compared on its own rather than after a divergence.
         errs = {"ours_l": [], "ref_l": [], "ours_s": [], "ref_s": []}
+        fp8_top1 = []
         with torch.inference_mode():
             for step in range(8):
                 x_in = torch.cat([emb, seed], -1)
@@ -150,7 +152,10 @@ def main():
                     tg, bt, ln = attn[0] if t == "sliding_attention" else attn[1]
                     x = layer.forward(x, pos, tg, bt, ln, decode, 1.0)
                 d = ours.norm.forward(x)
-                o_logits = ours.lm_head.logits_all_rows(d)[0]
+                # The body is gated through the checkpoint's bf16 head; the served fp8 head is
+                # reported as top-1 agreement (its only use is the draft argmax).
+                o_logits = (d.float() @ head_bf16.float().t())[0]
+                fp8_top1.append(int(ours.lm_head.forward(d)[0].argmax()) == int(r32.logits[0, -1].argmax()))
                 o_seed = ours.post_projection.forward(d)[0]
                 gt_l, gt_s = r32.logits[0, -1], r32.last_hidden_state[0, -1]
                 errs["ours_l"].append(rel(o_logits, gt_l))
@@ -164,6 +169,7 @@ def main():
                   f"ours {mean['ours_l']:.2e}, reference bf16 {mean['ref_l']:.2e}")
             check(f"L={L} seed vs fp32 (mean of 8 steps)", mean["ours_s"] <= 1.25 * mean["ref_s"],
                   f"ours {mean['ours_s']:.2e}, reference bf16 {mean['ref_s']:.2e}")
+            print(f"  info  L={L} fp8 head top-1 == fp32 top-1 on {sum(fp8_top1)}/{len(fp8_top1)} steps")
             # The same chain through the drafter's own step(): tokens it drafts from the fp32
             # reference's first input must match the fp32 reference's greedy chain.
             emb0 = torch.randn(1, B, generator=g).bfloat16().to(DEV)

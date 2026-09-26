@@ -1,11 +1,11 @@
-"""ParallelLMHead.argmax_all_rows == argmax over the full vocab row, for every TP rank (CPU).
+"""vocab_parallel_argmax over per-rank vocab shards == argmax over the full row, on every rank (CPU).
 
 Two ranks are simulated in one process: each rank's head holds its own vocab shard and the
 all_gather is replaced by a stub that stacks both ranks' (max, id) pairs, exactly as the collective
 would. Covers an odd vocab (padded last shard), a tie inside a shard and a tie across the shard
 boundary (the full-row argmax takes the lower id).
 
-    PYTHONPATH=python python tests/lm_head_argmax_all_rows_test.py
+    PYTHONPATH=python python tests/vocab_parallel_argmax_test.py
 """
 from __future__ import annotations
 
@@ -67,8 +67,7 @@ def main() -> int:
     full = (x @ weight.t()).argmax(dim=-1)
     ok = True
     for rank, h in enumerate(heads):
-        h._comm = _Gather(heads, x)
-        got = h.argmax_all_rows(x)
+        got = E.vocab_parallel_argmax(h.logits_local_shard(x), h.vocab_range[0], _Gather(heads, x), TP)
         match = torch.equal(got, full)
         ok &= match
         print(f"  {'OK  ' if match else 'FAIL'}  rank {rank}: {got.tolist()} vs full-row {full.tolist()}")

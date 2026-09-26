@@ -80,6 +80,19 @@ def _lm_head_linear(x: torch.Tensor, weight: torch.Tensor,
     return out
 
 
+def vocab_parallel_argmax(local: torch.Tensor, start: int, comm, tp_size: int) -> torch.Tensor:
+    """Greedy token per row from this rank's vocab-shard scores ([rows, count], ids start..), identical
+    on every TP rank without gathering the scores: only (max, id) pairs are exchanged. Ties resolve to
+    the lowest vocab id, as a full-row argmax would (shards are in ascending vocab order)."""
+    val, idx = local.max(dim=-1)
+    if tp_size == 1:
+        return idx + start
+    pair = torch.stack([val.float(), (idx + start).float()], dim=-1)   # ids < 2^24: exact in fp32
+    allp = comm.all_gather(pair.contiguous()).view(tp_size, -1, 2)
+    best = allp[..., 0].argmax(dim=0)                                  # first max = lowest rank
+    return allp[..., 1].gather(0, best[None]).squeeze(0).to(torch.int64)
+
+
 class VocabParallelEmbedding(BaseOP):
     def __init__(
         self,
@@ -198,20 +211,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         _, count = self.vocab_range
         logits = _lm_head_linear(x, module.weight, self.bias)
         return logits if logits.shape[1] == count else logits[:, :count]
-
-    def argmax_all_rows(self, x: torch.Tensor) -> torch.Tensor:
-        """Greedy token per row, identical on every TP rank, without gathering the logits: each rank
-        reduces its own vocab shard and only (max, index) pairs are exchanged. Ties resolve to the
-        lowest vocab id, as a full-row argmax would (shards are in ascending vocab order)."""
-        local = self.logits_local_shard(x)                        # [rows, count] fp32
-        val, idx = local.max(dim=-1)
-        if self.tp_size == 1:
-            return idx
-        start, _ = self.vocab_range
-        pair = torch.stack([val, (idx + start).to(torch.float32)], dim=-1)  # ids < 2^24: exact
-        allp = self._comm.all_gather(pair.contiguous()).view(self.tp_size, -1, 2)
-        best = allp[..., 0].argmax(dim=0)                         # first max = lowest rank
-        return allp[..., 1].gather(0, best[None]).squeeze(0).to(torch.int64)
 
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:

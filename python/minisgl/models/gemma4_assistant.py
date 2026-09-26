@@ -13,8 +13,9 @@ keys, so a draft chain needs no draft-side cache or rollback.
 
 TP: q_proj / gate / up are column-sharded by head / intermediate, o_proj and down_proj are
 row-sharded (all_reduce), matching the target's kv-head sharding so each rank's q heads read its own
-kv heads. pre/post_projection are replicated; lm_head is vocab-parallel over the drafter's own
-(tied) embedding.
+kv heads. pre/post_projection are replicated. lm_head (the drafter's own tied embedding) is
+vocab-sharded and served as fp8 weight-only: it is the drafter's largest read per step, and only
+its argmax is used, which verify gates anyway.
 """
 from __future__ import annotations
 
@@ -22,8 +23,9 @@ from typing import List, Tuple
 
 import torch
 
-from minisgl.distributed import get_tp_info
-from minisgl.layers import ParallelLMHead, RMSNorm, gelu_tanh_and_mul
+from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.layers import RMSNorm, gelu_tanh_and_mul
+from minisgl.layers.embedding import vocab_parallel_argmax
 from minisgl.layers.base import BaseOP
 
 from .draft_linear import SHARD_COL, SHARD_NONE, SHARD_ROW, DraftLinear
@@ -110,7 +112,8 @@ class Gemma4AssistantDraft(BaseOP):
             for i, t in enumerate(self.layer_types)
         ]
         self.norm = RMSNorm(self.hidden, eps=eps)
-        self.lm_head = ParallelLMHead(self.vocab, self.hidden)
+        self.lm_head = DraftLinear(self.hidden, self.vocab, SHARD_COL)
+        self._comm = DistributedCommunicator()
 
     def load(self, sd: dict, device, dtype) -> None:
         """`sd` is the full checkpoint state dict (CPU); every tensor is sliced to this rank here."""
@@ -136,11 +139,7 @@ class Gemma4AssistantDraft(BaseOP):
             layer.down_proj.load(take(p + "mlp.down_proj.weight"), device)
             layer.layer_scalar = take(p + "layer_scalar").to(device)
         self.norm.weight = take("model.norm.weight").to(device)
-        emb = take("model.embed_tokens.weight")
-        start, count = self.lm_head.vocab_range
-        w = torch.zeros(self.lm_head.num_embeddings_tp, self.hidden, dtype=dtype)
-        w[:count] = emb[start:start + count]
-        self.lm_head.weight = w.to(device)
+        self.lm_head.load_quant(take("model.embed_tokens.weight"), "fp8", dtype, device)
         sd.pop("lm_head.weight", None)
         if sd:
             raise ValueError(f"gemma4_assistant: unexpected checkpoint tensors {sorted(sd)[:8]}")
@@ -155,7 +154,10 @@ class Gemma4AssistantDraft(BaseOP):
             tgt, bt, lens = attn[0] if t == "sliding_attention" else attn[1]
             x = layer.forward(x, pos, tgt, bt, lens, decode, scale)
         d = self.norm.forward(x)
-        tok = self.lm_head.argmax_all_rows(d)
+        head = self.lm_head
+        sharded = head.shard == SHARD_COL
+        tok = vocab_parallel_argmax(head.forward(d), head.tp_rank * head.local_out if sharded else 0,
+                                    self._comm, head.tp_size if sharded else 1)
         return tok, self.post_projection.forward(d)
 
 
