@@ -68,6 +68,7 @@ _QUANT_ARMS = {
 }
 
 from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.layers.minv import minv_linear
 from minisgl.layers.base import BaseOP
 from minisgl.utils import init_logger
 
@@ -241,7 +242,9 @@ class DraftLinear(BaseOP):
         elif self._wq is not None:
             y = self._w8a16_or_dequant(x)
         else:
-            y = F.linear(x, self.weight)
+            # The engine's M-invariant linear: the tuned bf16 decode GEMV at small M, rocBLAS only
+            # where that kernel does not apply.
+            y = minv_linear(x, self.weight)
         if self._comm is not None:
             # Row-parallel: every rank holds a partial sum over its slice of the contraction dim.
             # The all_reduce is what makes the result bit-identical across ranks, which is what keeps

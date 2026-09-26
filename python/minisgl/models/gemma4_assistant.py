@@ -155,7 +155,7 @@ class Gemma4AssistantDraft(BaseOP):
             tgt, bt, lens = attn[0] if t == "sliding_attention" else attn[1]
             x = layer.forward(x, pos, tgt, bt, lens, decode, scale)
         d = self.norm.forward(x)
-        tok = self.lm_head.logits_all_rows(d).argmax(dim=-1)
+        tok = self.lm_head.argmax_all_rows(d)
         return tok, self.post_projection.forward(d)
 
 
