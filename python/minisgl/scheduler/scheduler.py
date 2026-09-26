@@ -2445,20 +2445,6 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             break  # bonus token (t_i != draft[i], or i == K)
         return AcceptResult(emitted=emitted, num_accepted=n_acc)
 
-    def _draft_q(self, uid: int, draft: List[int], lblock: torch.Tensor) -> "torch.Tensor | None":
-        """The proposer's sampling distribution for this req's drafts (None = argmax drafts). The
-        proposer only samples rows it knows will be verified here, so a q that does not cover every
-        draft or does not span the target vocab is a bug, not a fallback: verifying a sampled draft
-        as if it were deterministic is not lossless."""
-        q = self._proposer.draft_distribution(uid) if self._proposer is not None else None
-        if q is None:
-            return None
-        if q.shape[0] < len(draft) or q.shape[-1] != lblock.shape[-1]:
-            raise RuntimeError(
-                f"spec: draft distribution {tuple(q.shape)} does not cover {len(draft)} drafts x "
-                f"vocab {lblock.shape[-1]} for uid {uid}")
-        return q[: len(draft)].to(torch.float32)
-
     def _verify_sampled_constrained(
         self, matcher, draft: List[int], logits_block: torch.Tensor, sp, gen, uid: int
     ) -> AcceptResult:
@@ -5183,7 +5169,6 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                             lblock, sp.temperature, sp.top_k, sp.top_p, min_p=sp.min_p
                         ),
                         gen,
-                        q=self._draft_q(req.uid, d, lblock),
                     )
                 else:
                     result = verify_greedy(d, preds[block_start : block_start + q_len].tolist())
@@ -5236,7 +5221,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     pblock = probs_from_logits(
                         lblock, sp.temperature, sp.top_k, sp.top_p, min_p=sp.min_p
                     )
-                    result = verify_sampled(d, pblock, gen, q=self._draft_q(req.uid, d, lblock))
+                    result = verify_sampled(d, pblock, gen)
             else:
                 matcher = (
                     self._grammar_matchers.get(req.uid)
