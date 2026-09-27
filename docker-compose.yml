@@ -146,6 +146,7 @@ x-lean-common: &lean-common
     MINISGL_GHOST_ORACLE_DIR: "${MINISGL_GHOST_ORACLE_DIR:-/ghost}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
     MINISGL_KV_SCALES_DIR: "${MINISGL_KV_SCALES_DIR:-/kv-scales}"
+    CALIBRATE_ONLY: "${CALIBRATE_ONLY:-}"
     # Fused HIP top-k/top-p sampler (engine/_sampler_hip.py). Default ON; 0 forces the pure-torch
     # reference sampler — the sampler-correctness A/B arm. Was NOT forwarded here, so setting it at
     # launch silently did nothing (the five-hops trap): the A/B would have run the kernel on both
