@@ -1044,6 +1044,8 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         self._think_gate = ThinkGate(
             enabled=os.environ.get("MINISGL_GRAMMAR_THINK_GATE", "1") not in ("0", "false", "no"),
             default_budget=int(os.environ.get("MINISGL_THINK_BUDGET", "1024") or 1024),
+            # Close a reasoning span whose tail is a verbatim loop this many tokens long (0 = off).
+            loop_span=int(os.environ.get("MINISGL_THINK_LOOP_SPAN", "384") or 0),
         )
         # delimiter string -> its token ids, resolved once per string (generic; the delimiters come
         # from the reasoning parser, which derives them from the checkpoint's own chat template).
@@ -1554,6 +1556,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                         # on the answer).
                         self._think_gate.commit(req.uid, next_token)
                         self._tool_gate.commit(req.uid, next_token)
+                        self._log_think_loop(req)
                     elif m is not None and not m.is_terminated():
                         m.accept_token(next_token)
                 fr = ("stop" if eos_hit else "length") if finished else None
@@ -2078,6 +2081,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+
+    def _log_think_loop(self, req: Req) -> None:
+        period = self._think_gate.take_loop_report(req.uid)
+        if period and self._tp_is_primary:
+            logger.warning(
+                "req %s: reasoning is a verbatim loop (period %d tokens) after %d reasoning tokens; "
+                "force-closing the span", req.uid, period, self._think_gate.count_of(req.uid) or 0)
 
     def _build_eos_suppress(self, batch: Batch) -> torch.Tensor | None:
         """Bool [batch.size] marking rows whose req is still inside its reasoning span (gate armed, not
@@ -5285,6 +5295,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             if gate_armed:
                 self._think_gate.commit_many(req.uid, keep)
                 self._tool_gate.commit_many(req.uid, keep)
+                self._log_think_loop(req)
             # DSpark confidence CALIBRATION (MINISGL_DSPARK_CONF_CAL=1). Position j is REACHED when
             # every position before it was accepted (j <= num_accepted) and ACCEPTED when
             # j < num_accepted. Comparing P(accept | reached) against the head's own prediction says

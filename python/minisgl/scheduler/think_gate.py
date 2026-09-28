@@ -241,6 +241,12 @@ class _GateState:
     count: int = 0                 # reasoning tokens committed; forced tokens are NOT counted
     window: List[int] = field(default_factory=list)  # rolling last `width` committed tokens
     forcing: int = -1              # -1 = no force run in flight; else next index into `force`
+    # Verbatim-loop detector (see ThinkGate._loop_step). `hist` holds the last `loop_period` reasoning
+    # tokens; `runs[p]` is how many consecutive tokens have equalled the token p positions back.
+    hist: List[int] = field(default_factory=list)
+    runs: List[int] = field(default_factory=list)
+    loop: int = 0                  # period of the detected loop; 0 = none
+    loop_reported: bool = False
 
 
 class ThinkGate:
@@ -251,9 +257,17 @@ class ThinkGate:
     ``force``). A released uid is remembered in ``_done`` so it cannot re-arm mid-request.
     """
 
-    def __init__(self, *, enabled: bool = True, default_budget: int = 1024) -> None:
+    def __init__(self, *, enabled: bool = True, default_budget: int = 1024,
+                 loop_span: int = 384, loop_reps: int = 8, loop_period: int = 128) -> None:
         self._enabled = bool(enabled)
         self._default_budget = int(default_budget) if int(default_budget) > 0 else 1024
+        # Verbatim-loop breaker: a reasoning span whose tail is `loop_reps`+ back-to-back copies of
+        # one unit of <= `loop_period` tokens, covering >= `loop_span` tokens, is closed by the
+        # backstop immediately instead of at the budget — including under an unbounded budget, where
+        # a loop would otherwise run to max_tokens. loop_span <= 0 disables it.
+        self._loop_span = int(loop_span)
+        self._loop_reps = max(2, int(loop_reps))
+        self._loop_period = max(1, int(loop_period))
         self._st: Dict[int, _GateState] = {}
         self._done: Set[int] = set()
 
@@ -335,6 +349,7 @@ class ThinkGate:
             budget=eff,
             width=max(_pattern_width(p) for p in patterns),
             may_suppress_eos=may_suppress,
+            runs=[0] * (self._loop_period + 1) if self._loop_span > 0 else [],
         )
         return True
 
@@ -452,6 +467,8 @@ class ThinkGate:
             # match resolves would mean a divergent match silently loses those tokens from the
             # budget; the cost of counting them is a handful of tokens against a budget of hundreds.
             st.count += 1
+            if st.runs and not st.loop:
+                self._loop_step(st, int(token))
 
         if self._released(st.window, st.releases):
             self.clear(uid)
@@ -472,7 +489,40 @@ class ThinkGate:
                 return i
         return None
 
+    def take_loop_report(self, uid) -> int:
+        """Period of a loop detected since the last call, or 0. Reports once per request; for the
+        scheduler's log line only — gate behaviour never depends on it."""
+        st = self._st.get(uid)
+        if st is None or not st.loop or st.loop_reported:
+            return 0
+        st.loop_reported = True
+        return st.loop
+
     # ---------------------------------------------------------------- internals
+
+    def _loop_step(self, st: _GateState, token: int) -> None:
+        """Advance the verbatim-loop detector by one reasoning token; on detection, spend the budget
+        so the backstop force-closes the span on the next step.
+
+        A model locked into re-emitting one line or block puts ~1.0 on the continuation and ~0 on
+        the closer, so nothing but the budget ends the span. `runs[p]` counts consecutive tokens
+        equal to the one p back: a unit of p tokens repeated r times gives runs[p] == p*(r-1). The
+        span and repeat floors keep it off legitimate repetition (tables, rulers, short lists)."""
+        hist, runs = st.hist, st.runs
+        n = len(hist)
+        for p in range(1, min(self._loop_period, n) + 1):
+            if hist[n - p] == token:
+                r = runs[p] + 1
+                runs[p] = r
+                if r >= self._loop_span and r >= p * self._loop_reps:
+                    st.loop = p
+                    st.budget = min(st.budget, st.count)
+                    break
+            else:
+                runs[p] = 0
+        hist.append(token)
+        if n >= self._loop_period:
+            del hist[0]
 
     @staticmethod
     def _suffix_eq(window: List[int], seq: Ids, end: int) -> bool:

@@ -324,8 +324,8 @@ def purity() -> None:
     check("unbounded budget is not the default", g6.budget_of(5) != 1024, f"{g6.budget_of(5)}")
     check("unbounded budget survives the max_tokens clamp", g6.budget_of(5) > 10**6,
           f"{g6.budget_of(5)}")
-    for _ in range(5000):
-        g6.commit(5, 7)                      # 7 is in no delimiter: plain reasoning tokens
+    for i in range(5000):
+        g6.commit(5, 1000 + i)               # in no delimiter, and not a loop: plain reasoning
     check("unbounded never forces", g6.forced_next(5) is None, f"{g6.forced_next(5)}")
     # And therefore must NOT hold EOS. Suppression is only safe when the backstop will release it;
     # unbounded + suppressed EOS is a request that can never terminate, which shipped once and
@@ -341,6 +341,68 @@ def purity() -> None:
           f"{g7.budget_of(6)}")
 
 
+def loop() -> None:
+    print("\nLOOP — a verbatim loop in the reasoning span is force-closed before the budget")
+    CLOSE = (101,)                                       # Gemma-4 `<channel|>`
+    prefix = list(range(1000, 1600))                     # 600 distinct reasoning tokens
+    unit = [5, 6, 7, 8, 9, 10, 107]                      # a 7-token line, `\n` included
+
+    def run(gate, uid, stream):
+        for i, t in enumerate(stream):
+            gate.commit(uid, t)
+            if gate.forced_next(uid) is not None:
+                return i
+        return None
+
+    g = TG(default_budget=1024)
+    g.arm(1, force_seq=CLOSE, budget=16384)
+    fired = run(g, 1, prefix + unit * 200)
+    # First copy seeds the history; the run then needs max(384, 7*8) matching tokens.
+    check("fires once the run covers the span", fired == len(prefix) + len(unit) + 384 - 1, f"{fired}")
+    check("forces the close delimiter", g.forced_next(1) == 101)
+    check("EOS no longer held once forcing", g.suppress_eos(1) is False)
+    check("reports the period once", g.take_loop_report(1) == 7 and g.take_loop_report(1) == 0)
+    g.commit(1, 101)
+    check("forced close releases the gate", not g.is_armed(1) and g.is_done(1))
+
+    g2 = TG(default_budget=1024)
+    g2.arm(2, force_seq=CLOSE, budget=-1)                # unbounded
+    check("fires under an unbounded budget too", run(g2, 2, prefix + unit * 200) is not None)
+
+    g3 = TG(default_budget=1024)
+    g3.arm(3, force_seq=CLOSE, budget=16384)
+    ruler = [42] * 383                                   # one short of the span
+    check("run below the span does not fire", run(g3, 3, prefix + ruler + prefix) is None)
+
+    g4 = TG(default_budget=1024)
+    g4.arm(4, force_seq=CLOSE, budget=16384)
+    varied = []
+    for k in range(300):                                 # same line, one token differs per copy
+        varied += [5, 6, 7, 2000 + k, 9, 10, 107]
+    check("near-repeats do not fire", run(g4, 4, prefix + varied) is None)
+
+    g5 = TG(default_budget=1024)
+    g5.arm(5, force_seq=CLOSE, budget=16384)
+    few = [3000 + i for i in range(100)] * 6             # 6 copies of a 100-token block: 500 tokens
+    check("span without enough copies does not fire", run(g5, 5, prefix + few) is None)
+
+    g6 = TG(default_budget=1024, loop_span=0)
+    g6.arm(6, force_seq=CLOSE, budget=16384)
+    check("loop_span=0 disables it", run(g6, 6, prefix + unit * 200) is None)
+
+    # The spec path commits a chain at once; it must land in the same state as one-by-one commits.
+    a, b = TG(default_budget=1024), TG(default_budget=1024)
+    a.arm(7, force_seq=CLOSE, budget=16384)
+    b.arm(7, force_seq=CLOSE, budget=16384)
+    stream = prefix + unit * 80
+    for t in stream:
+        a.commit(7, t)
+    for i in range(0, len(stream), 4):
+        b.commit_many(7, stream[i:i + 4])
+    check("commit_many matches commit", (a.forced_next(7), a.count_of(7), a.budget_of(7))
+          == (b.forced_next(7), b.count_of(7), b.budget_of(7)))
+
+
 if __name__ == "__main__":
     muse()
     synthetic()
@@ -348,5 +410,6 @@ if __name__ == "__main__":
     overlap()
     parity()
     purity()
+    loop()
     print(f"\n{len(FAILED)} failed" if FAILED else "\nall passed")
     sys.exit(1 if FAILED else 0)
